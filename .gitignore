@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+
+# runtime artifacts
+outputs/
+logs/
+
+# local_db: keep folder structure only
+local_db/**
+!local_db/**/
+!local_db/.gitkeep
+!local_db/**/.gitkeep
+
+# parquet cache files should never be committed
+*.parquet
+

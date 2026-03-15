@@ -1,0 +1,22 @@
+[project]
+name = "delta-hedge"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.8",
+    "pandas>=3.0.1",
+    "pandas-market-calendars>=5.3.1.2",
+    "polars>=1.38.1",
+    "py-vollib>=1.0.1",
+    "pyarrow>=23.0.1",
+    "pyyaml>=6.0.3",
+    "quantlib>=1.41",
+    "tushare>=1.4.25",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
