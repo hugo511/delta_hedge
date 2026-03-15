@@ -140,7 +140,7 @@ class CrrModel:
         vol: float,
         ttm: float,
         option_type: str,
-        bump: float = 0.005,
+        bump: float = 0.001,
         steps: int = 80,
     ) -> float:
         if spot <= 0:
@@ -256,6 +256,20 @@ class ContractSelector:
 
         call = call_opts.row(0, named=True)
         put = put_opts.row(0, named=True)
+
+        # 最小入侵修复：
+        # 若当前持仓仍有效，且新候选仅是同到期月下的ATM执行价变化（同future+同expiry），
+        # 则不触发换仓，避免在roll窗口内频繁“同月换strike”。
+        if self.selected_contract is not None:
+            current_active = self.opt_basic.filter(
+                (pl.col("ts_code").is_in([self.selected_contract.call_ts_code, self.selected_contract.put_ts_code]))
+                & (pl.col("list_date") <= td)
+                & (pl.col("delist_date") >= td)
+            ).height >= 2
+            same_future = future_ts_code == self.selected_contract.future_ts_code
+            same_option_expiry = option_expiry_date == self.selected_contract.option_expiry_date
+            if current_active and same_future and same_option_expiry:
+                return self.selected_contract
 
         self.selected_contract = SelectedContracts(
             future_ts_code=future_ts_code,
@@ -437,8 +451,8 @@ class BacktestDataModule:
     def get_day_bars(self, selected: SelectedContracts, trade_date: date) -> pl.DataFrame:
         fut_day = (
             self.fut_bars.filter((pl.col("ts_code") == selected.future_ts_code) & (pl.col("trade_date") == trade_date))
-            .select(["bar_ts", "close"])
-            .rename({"close": "future_close"})
+            .select(["bar_ts", "open", "close"])
+            .rename({"open": "future_open", "close": "future_close"})
         )
         call_day = (
             self.opt_bars.filter((pl.col("ts_code") == selected.call_ts_code) & (pl.col("trade_date") == trade_date))
@@ -469,17 +483,21 @@ class DeltaHedgeStrategy:
         bar: dict,
         rate: float,
     ) -> dict | None:
+        fut_open = _safe_float(bar["future_open"])
         fut_px = _safe_float(bar["future_close"])
         call_px = _safe_float(bar["call_close"])
         put_px = _safe_float(bar["put_close"])
-        if fut_px <= 0:
+        if fut_open <= 0:
+            fut_open = fut_px
+        if fut_px <= 0 or fut_open <= 0:
             return None
 
         ttm = _year_fraction(selected.option_expiry_date, trade_date)
         iv_call = self.iv_cache_by_option.get(selected.call_ts_code, 0.2)
         iv_put = self.iv_cache_by_option.get(selected.put_ts_code, 0.2)
-        delta_call = CrrModel.delta(fut_px, selected.strike, rate, iv_call, ttm, "C")
-        delta_put = CrrModel.delta(fut_px, selected.strike, rate, iv_put, ttm, "P")
+        # 对冲目标用bar open的期货价格计算，匹配开仓对冲时点
+        delta_call = CrrModel.delta(fut_open, selected.strike, rate, iv_call, ttm, "C")
+        delta_put = CrrModel.delta(fut_open, selected.strike, rate, iv_put, ttm, "P")
         combo_delta = delta_call + delta_put
 
         scale = 1.0
@@ -490,6 +508,7 @@ class DeltaHedgeStrategy:
         return {
             "trade_date": trade_date,
             "bar_ts": bar["bar_ts"],
+            "future_open": fut_open,
             "future_close": fut_px,
             "call_close": call_px,
             "put_close": put_px,
@@ -533,6 +552,8 @@ class BrokerEngine:
         self.margin_rate = margin_rate
         # futures
         self.prev_fut_px: float = 0.0
+        self.current_future_code: str | None = None
+        self.current_future_per_unit: float = 1.0
         self.current_future_position = 0.0
         # options
         self.option_position_call = 0.0
@@ -546,23 +567,67 @@ class BrokerEngine:
         self.prev_nav: float | None = None
 
     def on_decision(self, selected: SelectedContracts, decision: dict) -> None:
+        fut_open = _safe_float(decision["future_open"])
         fut_px = _safe_float(decision["future_close"])
+        if fut_open <= 0:
+            fut_open = fut_px
         call_px = _safe_float(decision["call_close"])
         put_px = _safe_float(decision["put_close"])
+        option_unit = selected.option_per_unit
 
         # =========================
-        # 1 FUTURES MARK TO MARKET
+        # 1 FUTURES OVERNIGHT MTM TO BAR OPEN
         # =========================
-        if self.prev_fut_px != 0:
-            future_pnl = (
+        future_contract_changed = (
+            self.current_future_code is not None
+            and self.current_future_code != selected.future_ts_code
+        )
+        future_overnight_pnl = 0.0
+        if self.prev_fut_px != 0 and not future_contract_changed:
+            future_overnight_pnl = (
                 self.current_future_position
-                * (fut_px - self.prev_fut_px)
+                * (fut_open - self.prev_fut_px)
                 * selected.future_per_unit
             )
-            self.cash += future_pnl
+            self.cash += future_overnight_pnl
+
+        # 合约切换时先平旧期货仓位，避免跨合约价格直接做隔夜PnL
+        roll_close_qty = 0.0
+        roll_close_price = 0.0
+        roll_close_fee = 0.0
+        if future_contract_changed and self.current_future_position != 0:
+            roll_close_qty = -self.current_future_position
+            roll_close_price = self.prev_fut_px if self.prev_fut_px > 0 else fut_open
+            roll_close_fee = (
+                abs(roll_close_qty)
+                * roll_close_price
+                * self.current_future_per_unit
+                * self.fee_rate
+            )
+            self.cash -= roll_close_fee
+            self.current_future_position = 0.0
         
         # =========================
-        # 2 OPTION ROLL CHECK
+        # 2 OPTION LEG PNL (mark-to-market, no pnl on roll switch)
+        # =========================
+        call_leg_pnl = 0.0
+        put_leg_pnl = 0.0
+        if self.current_call_code == selected.call_ts_code and self.prev_call_px is not None:
+            call_leg_pnl = (
+                (call_px - self.prev_call_px)
+                * self.option_position_call
+                * option_unit
+            )
+        if self.current_put_code == selected.put_ts_code and self.prev_put_px is not None:
+            put_leg_pnl = (
+                (put_px - self.prev_put_px)
+                * self.option_position_put
+                * option_unit
+            )
+        option_combo_pnl = call_leg_pnl + put_leg_pnl
+
+        # =========================
+        # 3 OPTION ROLL CHECK
         # =========================
         option_changed = (
             self.current_call_code != selected.call_ts_code
@@ -574,42 +639,56 @@ class BrokerEngine:
                 self.cash += (
                     self.prev_call_px
                     * self.option_position_call
-                    * selected.option_per_unit
+                    * option_unit
                 )
             if self.option_position_put != 0 and self.prev_put_px is not None:
                 self.cash += (
                     self.prev_put_px
                     * self.option_position_put
-                    * selected.option_per_unit
+                    * option_unit
                 )
             # open new options (1 call + 1 put)
             size = self.straddle_size
-            self.cash -= call_px * size * selected.option_per_unit
-            self.cash -= put_px * size * selected.option_per_unit
+            self.cash -= call_px * size * option_unit
+            self.cash -= put_px * size * option_unit
             self.option_position_call = size
             self.option_position_put = size
             self.current_call_code = selected.call_ts_code
             self.current_put_code = selected.put_ts_code
 
         # =========================
-        # 3 FUTURE HEDGE TRADE
+        # 4 FUTURE HEDGE TRADE
         # =========================
         target_pos = _safe_float(decision["target_future_position"]) * self.straddle_size
         trade_qty = target_pos - self.current_future_position
         trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
-        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
+        # 对冲交易发生在bar open
+        exec_price = fut_open * (1 + trade_sign * self.slippage_bps / 10000.0)
         trade_notional = trade_qty * exec_price * selected.future_per_unit
         fee = abs(trade_qty) * exec_price * selected.future_per_unit * self.fee_rate
+        slippage_cost = trade_qty * (exec_price - fut_open) * selected.future_per_unit
 
+        self.cash -= slippage_cost
         self.cash -= fee
         self.current_future_position = target_pos
+        self.current_future_code = selected.future_ts_code
+        self.current_future_per_unit = selected.future_per_unit
+
+        # bar内期货持仓从open持有到close的PnL
+        future_intrabar_pnl = (
+            self.current_future_position
+            * (fut_px - fut_open)
+            * selected.future_per_unit
+        )
+        self.cash += future_intrabar_pnl
+        future_leg_pnl = future_overnight_pnl + future_intrabar_pnl
 
         # =========================
-        # 4 OPTION MARKET VALUE
+        # 5 OPTION MARKET VALUE
         # =========================
         option_market_value = (
-            call_px * self.option_position_call * selected.option_per_unit
-            + put_px * self.option_position_put * selected.option_per_unit
+            call_px * self.option_position_call * option_unit
+            + put_px * self.option_position_put * option_unit
         )
 
         # =========================
@@ -627,13 +706,13 @@ class BrokerEngine:
         capital_used = option_market_value + future_margin
 
         # =========================
-        # 5 NAV
+        # 6 NAV
         # =========================
         # futures already marked to market
         nav = self.cash + option_market_value
         pnl = 0.0 if self.prev_nav is None else nav - self.prev_nav
         self.prev_nav = nav
-        self.prev_fut_px = fut_px
+        trading_cost = fee + slippage_cost + roll_close_fee
 
         # 更新价格缓存
         self.prev_fut_px = fut_px
@@ -641,7 +720,7 @@ class BrokerEngine:
         self.prev_put_px = put_px
 
         # =================================
-        # 6 RECORD
+        # 7 RECORD
         # =================================
         future_notional = (
             self.current_future_position
@@ -652,22 +731,45 @@ class BrokerEngine:
         self.records.append(
             {
                 **decision,
+                # contract info
                 "future_ts_code": selected.future_ts_code,
                 "call_ts_code": selected.call_ts_code,
                 "put_ts_code": selected.put_ts_code,
+                # position info
+                "current_future_position": self.current_future_position,
+                "option_position_call": self.option_position_call,
+                "option_position_put": self.option_position_put,
+                # price info
+                "future_open": fut_open,
+                "future_close": fut_px,
+                "call_close": call_px,
+                "put_close": put_px,
+                # pnl info
+                "cash": self.cash,
+                "nav": nav,
+                "pnl": pnl,
+                "future_pnl": future_leg_pnl,
+                "future_overnight_pnl": future_overnight_pnl,
+                "future_intrabar_pnl": future_intrabar_pnl,
+                "option_pnl": option_combo_pnl,
+                "call_pnl": call_leg_pnl,
+                "put_pnl": put_leg_pnl,
+                "slippage_cost": slippage_cost,
+                "trading_cost": trading_cost,
+                "explained_pnl": future_leg_pnl + option_combo_pnl - trading_cost,                
+                # trade info
                 "trade_qty": trade_qty,
                 "exec_price": exec_price,
                 "trade_notional": trade_notional,
                 "fee": fee,
-                "cash": self.cash,
+                "future_contract_changed": future_contract_changed,
+                "roll_close_qty": roll_close_qty,
+                "roll_close_price": roll_close_price,
+                "roll_close_fee": roll_close_fee,
+                # notionals
                 "future_market_value": future_notional,
                 "option_market_value": option_market_value,
                 "capital_used": capital_used,
-                "nav": nav,
-                "pnl": pnl,
-                "current_future_position": self.current_future_position,
-                "option_position_call": self.option_position_call,
-                "option_position_put": self.option_position_put,
             }
         )
 
@@ -682,6 +784,10 @@ class BrokerEngine:
             detail.sort("bar_ts")
             .group_by("trade_date")
             .agg(
+                # contract info
+                pl.col("future_ts_code").last().alias("future_ts_code"),
+                pl.col("call_ts_code").last().alias("call_ts_code"),
+                pl.col("put_ts_code").last().alias("put_ts_code"),
                 pl.col("nav").last().alias("nav"),
                 pl.col("pnl").sum().alias("daily_pnl"),
                 pl.col("fee").sum().alias("daily_fee"),
@@ -691,6 +797,14 @@ class BrokerEngine:
                 pl.col("option_market_value").last().alias("option_market_value"),
                 pl.col("capital_used").last().alias("capital_used"),
                 pl.col("current_future_position").last().alias("future_position"),
+                # pnl aliases
+                pl.col("future_pnl").sum().alias("daily_future_pnl"),
+                pl.col("call_pnl").sum().alias("daily_call_pnl"),
+                pl.col("put_pnl").sum().alias("daily_put_pnl"),
+                pl.col("option_pnl").sum().alias("daily_option_pnl"),
+                pl.col("slippage_cost").sum().alias("daily_slippage_cost"),
+                pl.col("trading_cost").sum().alias("daily_trading_cost"),
+                pl.col("explained_pnl").sum().alias("daily_explained_pnl"),
             )
             .sort("trade_date")
             .with_columns(
