@@ -167,7 +167,7 @@ class OptionLoader(object):
                     delist_date=row['delist_date']
                 )
             
-            if i % 500 == 0:
+            if i % 1000 == 0:
                 log_info(f'已更新{i}个期权合约， 共{df_opt_basic.shape[0]}个期权合约')
         
         return
@@ -182,7 +182,7 @@ class OptionLoader(object):
 if __name__ == '__main__':
 
     from core.config_shema import load_config
-    cfg_exp = load_config('config/shfe_ag_demo.yaml')[0]
+    cfg_exp = load_config('config/shfe_ag_download_data.yaml')[0]
     option_loader = OptionLoader(cfg_exp)
     # option_loader.update_future_price_to_local_db()
     option_loader.update_option_price_to_local_db()

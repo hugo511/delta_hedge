@@ -1,89 +1,18 @@
-import math
-import numpy as np
+
+
+
+from typing import Literal
 import polars as pl
-import matplotlib.pyplot as plt
-from datetime import date, datetime
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import date
+from datetime import datetime
+import numpy as np
+import math
 
-
-from data_fetcher.option_loader import OptionLoader
 from core.config_shema import ExperimentConfig
+from data_fetcher.option_loader import OptionLoader
 from utils.logger import log_info
-
-
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _year_fraction(expiry_date: date, trade_date: date) -> float:
-    return max((expiry_date - trade_date).days, 1) / 365.0
-
-
-def plot_daily_pnl(
-    daily_result: pl.DataFrame,
-    output_path: str = "outputs/daily_pnl.png",
-    show: bool = False,
-) -> None:
-    """Plot NAV ratio, strategy return, capital usage and daily PnL."""
-    if daily_result.is_empty():
-        log_info("daily_result 为空，跳过绘图")
-        return
-    required_cols = {"trade_date", "daily_pnl", "nav_ratio", "strategy_return", "capital_usage"}
-    if not required_cols.issubset(set(daily_result.columns)):
-        log_info(f"daily_result 缺少必要列: {required_cols}")
-        return
-
-    df = daily_result.sort("trade_date")
-    pdf = df.select(["trade_date", "daily_pnl", "nav_ratio", "strategy_return", "capital_usage"]).to_pandas()
-
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-    axes[0].plot(pdf["trade_date"], pdf["nav_ratio"], lw=1.8, color="#1f77b4")
-    axes[0].set_title("NAV Ratio (NAV / Init Cash)")
-    axes[0].grid(alpha=0.25)
-
-    axes[1].plot(pdf["trade_date"], pdf["strategy_return"], lw=1.6, color="#2ca02c")
-    axes[1].set_title("Strategy Return (CumPnL / Capital Used)")
-    axes[1].grid(alpha=0.25)
-
-    axes[2].plot(pdf["trade_date"], pdf["capital_usage"], lw=1.6, color="#d62728")
-    axes[2].set_title("Capital Usage (Capital Used / NAV)")
-    axes[2].grid(alpha=0.25)
-
-    axes[3].bar(pdf["trade_date"], pdf["daily_pnl"], color="#ff7f0e", alpha=0.8)
-    axes[3].set_title("Daily PnL")
-    axes[3].grid(alpha=0.25)
-    axes[3].tick_params(axis="x", rotation=30)
-    axes[3].set_xlabel("Trade Date")
-
-    for ax in axes[:-1]:
-        ax.tick_params(axis="x", labelbottom=False)
-    fig.tight_layout()
-
-    out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig)
-    log_info(f"已保存PnL图: {out}")
-
-
-@dataclass
-class SelectedContracts:
-    future_ts_code: str
-    call_ts_code: str
-    put_ts_code: str
-    future_expiry_date: date
-    option_expiry_date: date
-    strike: float
-    option_per_unit: float
-    future_per_unit: float
+from utils.tools import _safe_float, _year_fraction
 
 
 TENOR_TO_YEAR = {
@@ -98,93 +27,197 @@ TENOR_TO_YEAR = {
 }
 
 
+@dataclass
+class SelectedContracts:
+    future_ts_code: str
+    call_ts_code: str
+    put_ts_code: str
+    future_expiry_date: date
+    option_expiry_date: date
+    strike: float
+    option_per_unit: float
+    future_per_unit: float
 
-class CrrModel:
-    @staticmethod
-    def price(
-        spot: float,
-        strike: float,
-        rate: float,
-        vol: float,
-        ttm: float,
-        option_type: str,
-        steps: int = 80,
-    ) -> float:
-        if spot <= 0 or strike <= 0 or ttm <= 0 or vol <= 0:
-            return max(spot - strike, 0.0) if option_type == "C" else max(strike - spot, 0.0)
+@dataclass
+class StrategyDecision:
+    trade_date: date
+    bar_ts: datetime
+    future_ts_code: str
+    future_close: float
+    future_per_unit: float
+    call_ts_code: str
+    call_close: float
+    put_ts_code: str
+    put_close: float
+    option_per_unit: float
+    rate: float
+    ttm: float
+    iv_call_used: float
+    iv_put_used: float
+    delta_call: float
+    delta_put: float
+    combo_delta: float
+    target_future_position: float
 
-        dt = ttm / steps
-        up = math.exp(vol * math.sqrt(dt))
-        dn = 1.0 / up
-        disc = math.exp(-rate * dt)
-        p = (math.exp(rate * dt) - dn) / (up - dn)
-        p = min(max(p, 1e-8), 1 - 1e-8)
 
-        values = []
-        for j in range(steps + 1):
-            s_t = spot * (up**j) * (dn ** (steps - j))
-            payoff = max(s_t - strike, 0.0) if option_type == "C" else max(strike - s_t, 0.0)
-            values.append(payoff)
+@dataclass
+class BrokerRecord:
+    trade_date: date
+    bar_ts: datetime
+    nav: float
+    pnl: float
+    pnl_future: float
+    pnl_call: float
+    pnl_put: float
+    pnl_option: float
+    cash: float
+    cash_future: float
+    cash_call: float
+    cash_put: float
+    cash_option: float
+    # future
+    future_ts_code: str
+    future_pnl: float
+    future_notional: float
+    # option
+    call_ts_code: str
+    call_pnl: float
+    call_notional: float
+    put_ts_code: str
+    put_pnl: float
+    put_notional: float
+    option_pnl: float
+    option_notional: float
+    # fee
+    fee: float
+    fee_future: float
+    fee_call: float
+    fee_put: float
+    fee_option: float
+    slippage: float
+    name: str=Literal["open", "mtm", "close"]
 
-        for i in range(steps - 1, -1, -1):
-            for j in range(i + 1):
-                values[j] = disc * (p * values[j + 1] + (1 - p) * values[j])
-        return values[0]
 
-    @classmethod
-    def delta(
-        cls,
-        spot: float,
-        strike: float,
-        rate: float,
-        vol: float,
-        ttm: float,
-        option_type: str,
-        bump: float = 0.001,
-        steps: int = 80,
-    ) -> float:
-        if spot <= 0:
-            return 0.0
-        up_spot = spot * (1 + bump)
-        dn_spot = max(spot * (1 - bump), 1e-6)
-        v_up = cls.price(up_spot, strike, rate, vol, ttm, option_type, steps=steps)
-        v_dn = cls.price(dn_spot, strike, rate, vol, ttm, option_type, steps=steps)
-        return (v_up - v_dn) / (up_spot - dn_spot)
 
-    @classmethod
-    def implied_vol(
-        cls,
-        market_price: float,
-        spot: float,
-        strike: float,
-        rate: float,
-        ttm: float,
-        option_type: str,
-        vol_low: float = 0.01,
-        vol_high: float = 2.0,
-        steps: int = 80,
-        tol: float = 1e-5,
-        max_iter: int = 80,
-    ) -> float:
-        if market_price <= 0 or spot <= 0 or strike <= 0 or ttm <= 0:
-            return 0.2
+class BacktestDataModule:
+    """Data module: update local DB and provide aligned bars."""
 
-        lo, hi = vol_low, vol_high
-        if market_price <= cls.price(spot, strike, rate, lo, ttm, option_type, steps=steps):
-            return lo
-        if market_price >= cls.price(spot, strike, rate, hi, ttm, option_type, steps=steps):
-            return hi
+    def __init__(self, cfg_exp: ExperimentConfig):
+        self.cfg_exp = cfg_exp
+        self.cfg_backtest = cfg_exp.backtest
+        self.cfg_hedge = cfg_exp.hedge
+        self.loader = OptionLoader(cfg_exp=cfg_exp)
 
-        for _ in range(max_iter):
-            mid = 0.5 * (lo + hi)
-            mid_price = cls.price(spot, strike, rate, mid, ttm, option_type, steps=steps)
-            if abs(mid_price - market_price) < tol:
-                return mid
-            if mid_price > market_price:
-                hi = mid
-            else:
-                lo = mid
-        return 0.5 * (lo + hi)
+        self.fut_basic = pl.DataFrame()
+        self.opt_basic = pl.DataFrame()
+        self.fut_bars = pl.DataFrame()
+        self.opt_bars = pl.DataFrame()
+        self.shibor_daily = pl.DataFrame()
+        self.trade_dates: list[date] = []
+
+    def adddata(self) -> None:
+        log_info(f"开始准备{self.cfg_hedge.frequency}频率的期货、期权、市场利率数据")
+        self.loader.update_future_price_to_local_db()
+        self.loader.update_option_price_to_local_db()
+        log_info("期货、期权、市场利率数据准备完成")
+
+        self.fut_basic = self.loader.load_future_basic(transform_date=True)
+        self.opt_basic = self.loader.load_option_basic(transform_date=True)
+        self.fut_bars, self.opt_bars = self._load_bar_data()
+        self.shibor_daily = self.loader.load_shibor_daily()
+        self.trade_dates = (
+            self.fut_bars.select("trade_date").unique().sort("trade_date").to_series().to_list()
+            if not self.fut_bars.is_empty()
+            else []
+        )
+
+    def get_day_bars(self, selected: SelectedContracts, trade_date: date) -> pl.DataFrame:
+        fut_day = (
+            self.fut_bars.filter((pl.col("ts_code") == selected.future_ts_code) & (pl.col("trade_date") == trade_date))
+            .select(["bar_ts", "open", "close"])
+            .rename({"open": "future_open", "close": "future_close"})
+        )
+        call_day = (
+            self.opt_bars.filter((pl.col("ts_code") == selected.call_ts_code) & (pl.col("trade_date") == trade_date))
+            .select(["bar_ts", "close"])
+            .rename({"close": "call_close"})
+        )
+        put_day = (
+            self.opt_bars.filter((pl.col("ts_code") == selected.put_ts_code) & (pl.col("trade_date") == trade_date))
+            .select(["bar_ts", "close"])
+            .rename({"close": "put_close"})
+        )
+        if fut_day.is_empty() or call_day.is_empty() or put_day.is_empty():
+            return pl.DataFrame()
+        return fut_day.join(call_day, on="bar_ts", how="inner").join(put_day, on="bar_ts", how="inner").sort("bar_ts")
+
+    # 输入ts_code和trade_date，返回期货或者call或者put的一根bar
+    def get_bar(
+        self, 
+        ts_code: str, 
+        bar_ts: datetime, 
+        instrument_type: Literal["future", "call", "put"]
+    ) -> pl.DataFrame:
+
+        if instrument_type == "future":
+            return self.fut_bars.filter((pl.col("ts_code") == ts_code) & (pl.col("bar_ts") == bar_ts)).sort("bar_ts")
+        elif instrument_type == "call":
+            return self.opt_bars.filter((pl.col("ts_code") == ts_code) & (pl.col("bar_ts") == bar_ts)).sort("bar_ts")
+        elif instrument_type == "put":
+            return self.opt_bars.filter((pl.col("ts_code") == ts_code) & (pl.col("bar_ts") == bar_ts)).sort("bar_ts")
+        else:
+            raise ValueError(f"Invalid instrument type: {instrument_type}")
+        # TODO columns name
+
+    def _load_bar_data(self) -> tuple[pl.DataFrame, pl.DataFrame]:
+        freq = self.cfg_hedge.frequency
+        fut_contracts = self.fut_basic.filter(
+            (pl.col("list_date") <= self.cfg_backtest.end_date)
+            & (pl.col("delist_date") >= self.cfg_backtest.start_date)
+        )
+        opt_contracts = self.opt_basic.filter(
+            (pl.col("list_date") <= self.cfg_backtest.end_date)
+            & (pl.col("delist_date") >= self.cfg_backtest.start_date)
+            & (pl.col("call_put").is_in(["C", "P"]))
+        )
+        # load future bars
+        fut_frames: list[pl.DataFrame] = []
+        for row in fut_contracts.iter_rows(named=True):
+            ts_code = row["ts_code"]
+            try:
+                df = self.loader.load_future_bar(ts_code=ts_code, freq=freq).with_columns(pl.lit(ts_code).alias("ts_code"))
+            except FileNotFoundError:
+                continue
+            fut_frames.append(df)
+        fut_bars = pl.concat(fut_frames, how="vertical_relaxed") if fut_frames else pl.DataFrame()
+
+        if not fut_bars.is_empty():
+            fut_bars = fut_bars.filter(
+                (pl.col("trade_date") >= self.cfg_backtest.start_date)
+                & (pl.col("trade_date") <= self.cfg_backtest.end_date)
+            )
+            fut_bars = ContractSelector._with_bar_timeline(fut_bars)
+        
+        # load option bars
+        opt_frames: list[pl.DataFrame] = []
+        for row in opt_contracts.iter_rows(named=True):
+            ts_code = row["ts_code"]
+            try:
+                df = self.loader.load_option_bar(ts_code=ts_code, freq=freq).with_columns(pl.lit(ts_code).alias("ts_code"))
+            except FileNotFoundError:
+                continue
+            opt_frames.append(df)
+        opt_bars = pl.concat(opt_frames, how="vertical_relaxed") if opt_frames else pl.DataFrame()
+
+        if not opt_bars.is_empty():
+            opt_bars = opt_bars.filter(
+                (pl.col("trade_date") >= self.cfg_backtest.start_date)
+                & (pl.col("trade_date") <= self.cfg_backtest.end_date)
+            )
+            opt_bars = ContractSelector._with_bar_timeline(opt_bars)
+
+        log_info(f"加载{freq}频率的期货、期权行情数据完成")
+        return fut_bars, opt_bars
 
 
 class ContractSelector:
@@ -257,7 +290,6 @@ class ContractSelector:
         call = call_opts.row(0, named=True)
         put = put_opts.row(0, named=True)
 
-        # 最小入侵修复：
         # 若当前持仓仍有效，且新候选仅是同到期月下的ATM执行价变化（同future+同expiry），
         # 则不触发换仓，避免在roll窗口内频繁“同月换strike”。
         if self.selected_contract is not None:
@@ -368,505 +400,6 @@ class ContractSelector:
 
 
 
-class BacktestDataModule:
-    """Data module: update local DB and provide aligned bars."""
-
-    def __init__(self, cfg_exp: ExperimentConfig):
-        self.cfg_exp = cfg_exp
-        self.cfg_backtest = cfg_exp.backtest
-        self.cfg_hedge = cfg_exp.hedge
-        self.loader = OptionLoader(cfg_exp=cfg_exp)
-
-        self.fut_basic = pl.DataFrame()
-        self.opt_basic = pl.DataFrame()
-        self.fut_bars = pl.DataFrame()
-        self.opt_bars = pl.DataFrame()
-        self.shibor_daily = pl.DataFrame()
-        self.trade_dates: list[date] = []
-
-    def adddata(self) -> None:
-        log_info(f"开始准备{self.cfg_hedge.frequency}频率的期货、期权、市场利率数据")
-        self.loader.update_future_price_to_local_db()
-        self.loader.update_option_price_to_local_db()
-        log_info("期货、期权、市场利率数据准备完成")
-
-        self.fut_basic = self.loader.load_future_basic(transform_date=True)
-        self.opt_basic = self.loader.load_option_basic(transform_date=True)
-        self.fut_bars, self.opt_bars = self._load_bar_data()
-        self.shibor_daily = self.loader.load_shibor_daily()
-        self.trade_dates = (
-            self.fut_bars.select("trade_date").unique().sort("trade_date").to_series().to_list()
-            if not self.fut_bars.is_empty()
-            else []
-        )
-
-    def _load_bar_data(self) -> tuple[pl.DataFrame, pl.DataFrame]:
-        freq = self.cfg_hedge.frequency
-        fut_contracts = self.fut_basic.filter(
-            (pl.col("list_date") <= self.cfg_backtest.end_date)
-            & (pl.col("delist_date") >= self.cfg_backtest.start_date)
-        )
-        opt_contracts = self.opt_basic.filter(
-            (pl.col("list_date") <= self.cfg_backtest.end_date)
-            & (pl.col("delist_date") >= self.cfg_backtest.start_date)
-            & (pl.col("call_put").is_in(["C", "P"]))
-        )
-
-        fut_frames: list[pl.DataFrame] = []
-        for row in fut_contracts.iter_rows(named=True):
-            ts_code = row["ts_code"]
-            try:
-                df = self.loader.load_future_bar(ts_code=ts_code, freq=freq).with_columns(pl.lit(ts_code).alias("ts_code"))
-            except FileNotFoundError:
-                continue
-            fut_frames.append(df)
-        fut_bars = pl.concat(fut_frames, how="vertical_relaxed") if fut_frames else pl.DataFrame()
-
-        opt_frames: list[pl.DataFrame] = []
-        for row in opt_contracts.iter_rows(named=True):
-            ts_code = row["ts_code"]
-            try:
-                df = self.loader.load_option_bar(ts_code=ts_code, freq=freq).with_columns(pl.lit(ts_code).alias("ts_code"))
-            except FileNotFoundError:
-                continue
-            opt_frames.append(df)
-        opt_bars = pl.concat(opt_frames, how="vertical_relaxed") if opt_frames else pl.DataFrame()
-
-        if not fut_bars.is_empty():
-            fut_bars = fut_bars.filter(
-                (pl.col("trade_date") >= self.cfg_backtest.start_date)
-                & (pl.col("trade_date") <= self.cfg_backtest.end_date)
-            )
-            fut_bars = ContractSelector._with_bar_timeline(fut_bars)
-        if not opt_bars.is_empty():
-            opt_bars = opt_bars.filter(
-                (pl.col("trade_date") >= self.cfg_backtest.start_date)
-                & (pl.col("trade_date") <= self.cfg_backtest.end_date)
-            )
-            opt_bars = ContractSelector._with_bar_timeline(opt_bars)
-
-        log_info(f"加载{freq}频率的期货、期权行情数据完成")
-        return fut_bars, opt_bars
-
-    def get_day_bars(self, selected: SelectedContracts, trade_date: date) -> pl.DataFrame:
-        fut_day = (
-            self.fut_bars.filter((pl.col("ts_code") == selected.future_ts_code) & (pl.col("trade_date") == trade_date))
-            .select(["bar_ts", "open", "close"])
-            .rename({"open": "future_open", "close": "future_close"})
-        )
-        call_day = (
-            self.opt_bars.filter((pl.col("ts_code") == selected.call_ts_code) & (pl.col("trade_date") == trade_date))
-            .select(["bar_ts", "close"])
-            .rename({"close": "call_close"})
-        )
-        put_day = (
-            self.opt_bars.filter((pl.col("ts_code") == selected.put_ts_code) & (pl.col("trade_date") == trade_date))
-            .select(["bar_ts", "close"])
-            .rename({"close": "put_close"})
-        )
-        if fut_day.is_empty() or call_day.is_empty() or put_day.is_empty():
-            return pl.DataFrame()
-        return fut_day.join(call_day, on="bar_ts", how="inner").join(put_day, on="bar_ts", how="inner").sort("bar_ts")
-
-
-class DeltaHedgeStrategy:
-    """Strategy module: produce target hedge position from bars."""
-
-    def __init__(self, cfg_exp: ExperimentConfig):
-        self.cfg_hedge = cfg_exp.hedge
-        self.iv_cache_by_option: dict[str, float] = {}
-
-    def on_bar(
-        self,
-        selected: SelectedContracts,
-        trade_date: date,
-        bar: dict,
-        rate: float,
-    ) -> dict | None:
-        fut_open = _safe_float(bar["future_open"])
-        fut_px = _safe_float(bar["future_close"])
-        call_px = _safe_float(bar["call_close"])
-        put_px = _safe_float(bar["put_close"])
-        if fut_open <= 0:
-            fut_open = fut_px
-        if fut_px <= 0 or fut_open <= 0:
-            return None
-
-        ttm = _year_fraction(selected.option_expiry_date, trade_date)
-        iv_call = self.iv_cache_by_option.get(selected.call_ts_code, 0.2)
-        iv_put = self.iv_cache_by_option.get(selected.put_ts_code, 0.2)
-        # 对冲目标用bar open的期货价格计算，匹配开仓对冲时点
-        delta_call = CrrModel.delta(fut_open, selected.strike, rate, iv_call, ttm, "C")
-        delta_put = CrrModel.delta(fut_open, selected.strike, rate, iv_put, ttm, "P")
-        combo_delta = delta_call + delta_put
-
-        scale = 1.0
-        if self.cfg_hedge.use_contract_unit:
-            scale = selected.option_per_unit / max(selected.future_per_unit, 1e-9)
-        target_pos = -combo_delta * scale
-
-        return {
-            "trade_date": trade_date,
-            "bar_ts": bar["bar_ts"],
-            "future_open": fut_open,
-            "future_close": fut_px,
-            "call_close": call_px,
-            "put_close": put_px,
-            "rate": rate,
-            "ttm": ttm,
-            "iv_call_used": iv_call,
-            "iv_put_used": iv_put,
-            "delta_call": delta_call,
-            "delta_put": delta_put,
-            "combo_delta": combo_delta,
-            "target_future_position": target_pos,
-        }
-
-    def on_day_close(self, selected: SelectedContracts, trade_date: date, last_bar: dict, rate: float) -> None:
-        spot = _safe_float(last_bar["future_close"])
-        if spot <= 0:
-            return
-        ttm = _year_fraction(selected.option_expiry_date, trade_date)
-        call_px = _safe_float(last_bar["call_close"])
-        put_px = _safe_float(last_bar["put_close"])
-        self.iv_cache_by_option[selected.call_ts_code] = CrrModel.implied_vol(call_px, spot, selected.strike, rate, ttm, "C")
-        self.iv_cache_by_option[selected.put_ts_code] = CrrModel.implied_vol(put_px, spot, selected.strike, rate, ttm, "P")
-
-
-class BrokerEngine:
-    """Execution & book module: convert target position into trades."""
-
-    def __init__(
-        self,
-        init_cash: float = 1_000_000.0,
-        fee_rate: float = 0.00005,
-        slippage_bps: float = 1.0,
-        straddle_size: float = 1.0,
-        margin_rate: float = 0.15, 
-    ):
-        self.init_cash = init_cash
-        self.cash = init_cash
-        self.fee_rate = fee_rate
-        self.slippage_bps = slippage_bps
-        self.straddle_size = straddle_size
-        self.margin_rate = margin_rate
-        # futures
-        self.prev_fut_px: float = 0.0
-        self.current_future_code: str | None = None
-        self.current_future_per_unit: float = 1.0
-        self.current_future_position = 0.0
-        # options
-        self.option_position_call = 0.0
-        self.option_position_put = 0.0
-        self.current_call_code: str | None = None
-        self.current_put_code: str | None = None
-        self.prev_call_px: float | None = None
-        self.prev_put_px: float | None = None
-
-        self.records: list[dict] = []
-        self.prev_nav: float | None = None
-
-    def on_decision(self, selected: SelectedContracts, decision: dict) -> None:
-        fut_open = _safe_float(decision["future_open"])
-        fut_px = _safe_float(decision["future_close"])
-        if fut_open <= 0:
-            fut_open = fut_px
-        call_px = _safe_float(decision["call_close"])
-        put_px = _safe_float(decision["put_close"])
-        option_unit = selected.option_per_unit
-
-        # =========================
-        # 1 FUTURES OVERNIGHT MTM TO BAR OPEN
-        # =========================
-        future_contract_changed = (
-            self.current_future_code is not None
-            and self.current_future_code != selected.future_ts_code
-        )
-        future_overnight_pnl = 0.0
-        if self.prev_fut_px != 0 and not future_contract_changed:
-            future_overnight_pnl = (
-                self.current_future_position
-                * (fut_open - self.prev_fut_px)
-                * selected.future_per_unit
-            )
-            self.cash += future_overnight_pnl
-
-        # 合约切换时先平旧期货仓位，避免跨合约价格直接做隔夜PnL
-        roll_close_qty = 0.0
-        roll_close_price = 0.0
-        roll_close_fee = 0.0
-        if future_contract_changed and self.current_future_position != 0:
-            roll_close_qty = -self.current_future_position
-            roll_close_price = self.prev_fut_px if self.prev_fut_px > 0 else fut_open
-            roll_close_fee = (
-                abs(roll_close_qty)
-                * roll_close_price
-                * self.current_future_per_unit
-                * self.fee_rate
-            )
-            self.cash -= roll_close_fee
-            self.current_future_position = 0.0
-        
-        # =========================
-        # 2 OPTION LEG PNL (mark-to-market, no pnl on roll switch)
-        # =========================
-        call_leg_pnl = 0.0
-        put_leg_pnl = 0.0
-        if self.current_call_code == selected.call_ts_code and self.prev_call_px is not None:
-            call_leg_pnl = (
-                (call_px - self.prev_call_px)
-                * self.option_position_call
-                * option_unit
-            )
-        if self.current_put_code == selected.put_ts_code and self.prev_put_px is not None:
-            put_leg_pnl = (
-                (put_px - self.prev_put_px)
-                * self.option_position_put
-                * option_unit
-            )
-        option_combo_pnl = call_leg_pnl + put_leg_pnl
-
-        # =========================
-        # 3 OPTION ROLL CHECK
-        # =========================
-        option_changed = (
-            self.current_call_code != selected.call_ts_code
-            or self.current_put_code != selected.put_ts_code
-        )
-        if option_changed:
-            # close old options
-            if self.option_position_call != 0 and self.prev_call_px is not None:
-                self.cash += (
-                    self.prev_call_px
-                    * self.option_position_call
-                    * option_unit
-                )
-            if self.option_position_put != 0 and self.prev_put_px is not None:
-                self.cash += (
-                    self.prev_put_px
-                    * self.option_position_put
-                    * option_unit
-                )
-            # open new options (1 call + 1 put)
-            size = self.straddle_size
-            self.cash -= call_px * size * option_unit
-            self.cash -= put_px * size * option_unit
-            self.option_position_call = size
-            self.option_position_put = size
-            self.current_call_code = selected.call_ts_code
-            self.current_put_code = selected.put_ts_code
-
-        # =========================
-        # 4 FUTURE HEDGE TRADE
-        # =========================
-        target_pos = _safe_float(decision["target_future_position"]) * self.straddle_size
-        trade_qty = target_pos - self.current_future_position
-        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
-        # 对冲交易发生在bar open
-        exec_price = fut_open * (1 + trade_sign * self.slippage_bps / 10000.0)
-        trade_notional = trade_qty * exec_price * selected.future_per_unit
-        fee = abs(trade_qty) * exec_price * selected.future_per_unit * self.fee_rate
-        slippage_cost = trade_qty * (exec_price - fut_open) * selected.future_per_unit
-
-        self.cash -= slippage_cost
-        self.cash -= fee
-        self.current_future_position = target_pos
-        self.current_future_code = selected.future_ts_code
-        self.current_future_per_unit = selected.future_per_unit
-
-        # bar内期货持仓从open持有到close的PnL
-        future_intrabar_pnl = (
-            self.current_future_position
-            * (fut_px - fut_open)
-            * selected.future_per_unit
-        )
-        self.cash += future_intrabar_pnl
-        future_leg_pnl = future_overnight_pnl + future_intrabar_pnl
-
-        # =========================
-        # 5 OPTION MARKET VALUE
-        # =========================
-        option_market_value = (
-            call_px * self.option_position_call * option_unit
-            + put_px * self.option_position_put * option_unit
-        )
-
-        # =========================
-        # FUTURE MARGIN
-        # =========================
-        future_margin = (
-            abs(self.current_future_position)
-            * fut_px
-            * selected.future_per_unit
-            * self.margin_rate
-        )
-        # =========================
-        # CAPITAL USED
-        # =========================
-        capital_used = option_market_value + future_margin
-
-        # =========================
-        # 6 NAV
-        # =========================
-        # futures already marked to market
-        nav = self.cash + option_market_value
-        pnl = 0.0 if self.prev_nav is None else nav - self.prev_nav
-        self.prev_nav = nav
-        trading_cost = fee + slippage_cost + roll_close_fee
-
-        # 更新价格缓存
-        self.prev_fut_px = fut_px
-        self.prev_call_px = call_px
-        self.prev_put_px = put_px
-
-        # =================================
-        # 7 RECORD
-        # =================================
-        future_notional = (
-            self.current_future_position
-            * fut_px
-            * selected.future_per_unit
-        )
-
-        self.records.append(
-            {
-                **decision,
-                # contract info
-                "future_ts_code": selected.future_ts_code,
-                "call_ts_code": selected.call_ts_code,
-                "put_ts_code": selected.put_ts_code,
-                # position info
-                "current_future_position": self.current_future_position,
-                "option_position_call": self.option_position_call,
-                "option_position_put": self.option_position_put,
-                # price info
-                "future_open": fut_open,
-                "future_close": fut_px,
-                "call_close": call_px,
-                "put_close": put_px,
-                # pnl info
-                "cash": self.cash,
-                "nav": nav,
-                "pnl": pnl,
-                "future_pnl": future_leg_pnl,
-                "future_overnight_pnl": future_overnight_pnl,
-                "future_intrabar_pnl": future_intrabar_pnl,
-                "option_pnl": option_combo_pnl,
-                "call_pnl": call_leg_pnl,
-                "put_pnl": put_leg_pnl,
-                "slippage_cost": slippage_cost,
-                "trading_cost": trading_cost,
-                "explained_pnl": future_leg_pnl + option_combo_pnl - trading_cost,                
-                # trade info
-                "trade_qty": trade_qty,
-                "exec_price": exec_price,
-                "trade_notional": trade_notional,
-                "fee": fee,
-                "future_contract_changed": future_contract_changed,
-                "roll_close_qty": roll_close_qty,
-                "roll_close_price": roll_close_price,
-                "roll_close_fee": roll_close_fee,
-                # notionals
-                "future_market_value": future_notional,
-                "option_market_value": option_market_value,
-                "capital_used": capital_used,
-            }
-        )
-
-    def to_frame(self) -> pl.DataFrame:
-        return pl.DataFrame(self.records) if self.records else pl.DataFrame()
-
-    def to_daily_frame(self) -> pl.DataFrame:
-        detail = self.to_frame()
-        if detail.is_empty():
-            return pl.DataFrame()
-        daily = (
-            detail.sort("bar_ts")
-            .group_by("trade_date")
-            .agg(
-                # contract info
-                pl.col("future_ts_code").last().alias("future_ts_code"),
-                pl.col("call_ts_code").last().alias("call_ts_code"),
-                pl.col("put_ts_code").last().alias("put_ts_code"),
-                pl.col("nav").last().alias("nav"),
-                pl.col("pnl").sum().alias("daily_pnl"),
-                pl.col("fee").sum().alias("daily_fee"),
-                pl.col("trade_qty").abs().sum().alias("daily_turnover_qty"),
-                pl.col("cash").last().alias("cash"),
-                pl.col("future_market_value").last().alias("future_market_value"),
-                pl.col("option_market_value").last().alias("option_market_value"),
-                pl.col("capital_used").last().alias("capital_used"),
-                pl.col("current_future_position").last().alias("future_position"),
-                # pnl aliases
-                pl.col("future_pnl").sum().alias("daily_future_pnl"),
-                pl.col("call_pnl").sum().alias("daily_call_pnl"),
-                pl.col("put_pnl").sum().alias("daily_put_pnl"),
-                pl.col("option_pnl").sum().alias("daily_option_pnl"),
-                pl.col("slippage_cost").sum().alias("daily_slippage_cost"),
-                pl.col("trading_cost").sum().alias("daily_trading_cost"),
-                pl.col("explained_pnl").sum().alias("daily_explained_pnl"),
-            )
-            .sort("trade_date")
-            .with_columns(
-                ((pl.col("nav") / pl.lit(self.init_cash))).alias("nav_ratio"),
-                (
-                    pl.col("daily_pnl").cum_sum()
-                    / pl.col("capital_used").clip(lower_bound=1e-6)
-                ).alias("strategy_return"),
-                (pl.col("capital_used") / pl.col("nav").clip(lower_bound=1e-6)).alias("capital_usage"),
-            )
-        )
-        return daily
-
-
-class DeltaHedgeRunner:
-    """Orchestrator: data -> strategy -> broker."""
-
-    def __init__(self, cfg_exp: ExperimentConfig, strategy_name: str):
-        self.strategy_name = strategy_name
-        self.cfg_exp = cfg_exp
-        self.data_module = BacktestDataModule(cfg_exp)
-        self.strategy = DeltaHedgeStrategy(cfg_exp)
-        self.broker = BrokerEngine(straddle_size=cfg_exp.hedge.straddle_size)
-        self.backtest_result = pl.DataFrame()
-        self.daily_result = pl.DataFrame()
-
-    def run(self) -> pl.DataFrame:
-        self.data_module.adddata()
-        risk_rater = RiskFreeRate(interest_df=self.data_module.shibor_daily)
-        selector = ContractSelector(
-            cfg_exp=self.cfg_exp,
-            fut_basic=self.data_module.fut_basic,
-            opt_basic=self.data_module.opt_basic,
-            fut_bars=self.data_module.fut_bars,
-            opt_bars=self.data_module.opt_bars,
-        )
-
-        log_info("开始回测")
-        for trade_date in self.data_module.trade_dates:
-            selected = selector.select_contract(trade_date)
-            
-            if selected is None:
-                continue
-            day_bars = self.data_module.get_day_bars(selected, trade_date)
-            if day_bars.is_empty():
-                continue
-
-            rate = risk_rater.get_rate(trade_date, _year_fraction(selected.option_expiry_date, trade_date))
-            for bar in day_bars.iter_rows(named=True):
-                decision = self.strategy.on_bar(selected, trade_date, bar, rate)
-                if decision is None:
-                    continue
-                self.broker.on_decision(selected, decision)
-
-            self.strategy.on_day_close(selected, trade_date, day_bars.tail(1).row(0, named=True), rate)
-
-        self.backtest_result = self.broker.to_frame()
-        self.daily_result = self.broker.to_daily_frame()
-        log_info("回测完成")
-        return self.backtest_result
-
-
 class RiskFreeRate:
     def __init__(self, interest_df: pl.DataFrame):
         self.interest_rate_df = interest_df
@@ -910,34 +443,513 @@ class RiskFreeRate:
 
 
 
+class CrrModel:
+    @staticmethod
+    def price(
+        spot: float,
+        strike: float,
+        rate: float,
+        vol: float,
+        ttm: float,
+        option_type: str,
+        steps: int = 80,
+    ) -> float:
+        if spot <= 0 or strike <= 0 or ttm <= 0 or vol <= 0:
+            return max(spot - strike, 0.0) if option_type == "C" else max(strike - spot, 0.0)
 
-if __name__ == '__main__':
-    from core.config_shema import load_config
-    cfg_exp = load_config('config/shfe_ag_demo.yaml')[0]
-    delta_hedge_runner = DeltaHedgeRunner(cfg_exp=cfg_exp, strategy_name='delta_hedge')
-    # 先看选约逻辑:
-    # delta_hedge_runner.demo_contract_selector(hedge_qty=0.0, max_days=30)
-    # 再跑完整三模块回测:
-    backtest_result = delta_hedge_runner.run()
-    print(backtest_result)
-    print(delta_hedge_runner.daily_result)
-    daily_position = (backtest_result
-        .sort("bar_ts")
-        .group_by("trade_date")
-        .agg(
-            pl.col("future_ts_code").last().alias("future_ts_code"),
-            pl.col("call_ts_code").last().alias("call_ts_code"),
-            pl.col("put_ts_code").last().alias("put_ts_code"),
-            pl.col("current_future_position").last().alias("future_position"),
-            pl.col("option_position_call").last().alias("call_position"),
-            pl.col("option_position_put").last().alias("put_position"),
-            pl.col("pnl").sum().alias("daily_pnl"),
-            pl.col("nav").last().alias("nav"),
+        dt = ttm / steps
+        up = math.exp(vol * math.sqrt(dt))
+        dn = 1.0 / up
+        disc = math.exp(-rate * dt)
+        p = (math.exp(rate * dt) - dn) / (up - dn)
+        p = min(max(p, 1e-8), 1 - 1e-8)
+
+        values = []
+        for j in range(steps + 1):
+            s_t = spot * (up**j) * (dn ** (steps - j))
+            payoff = max(s_t - strike, 0.0) if option_type == "C" else max(strike - s_t, 0.0)
+            values.append(payoff)
+
+        for i in range(steps - 1, -1, -1):
+            for j in range(i + 1):
+                values[j] = disc * (p * values[j + 1] + (1 - p) * values[j])
+        return values[0]
+
+    @classmethod
+    def delta(
+        cls,
+        spot: float,
+        strike: float,
+        rate: float,
+        vol: float,
+        ttm: float,
+        option_type: str,
+        bump: float = 0.001,
+        steps: int = 80,
+    ) -> float:
+        if spot <= 0:
+            return 0.0
+        up_spot = spot * (1 + bump)
+        dn_spot = max(spot * (1 - bump), 1e-6)
+        v_up = cls.price(up_spot, strike, rate, vol, ttm, option_type, steps=steps)
+        v_dn = cls.price(dn_spot, strike, rate, vol, ttm, option_type, steps=steps)
+        return (v_up - v_dn) / (up_spot - dn_spot)
+
+    @classmethod
+    def implied_vol(
+        cls,
+        market_price: float,
+        spot: float,
+        strike: float,
+        rate: float,
+        ttm: float,
+        option_type: str,
+        vol_low: float = 0.01,
+        vol_high: float = 2.0,
+        steps: int = 80,
+        tol: float = 1e-5,
+        max_iter: int = 80,
+    ) -> float:
+        if market_price <= 0 or spot <= 0 or strike <= 0 or ttm <= 0:
+            return 0.2
+
+        lo, hi = vol_low, vol_high
+        if market_price <= cls.price(spot, strike, rate, lo, ttm, option_type, steps=steps):
+            return lo
+        if market_price >= cls.price(spot, strike, rate, hi, ttm, option_type, steps=steps):
+            return hi
+
+        for _ in range(max_iter):
+            mid = 0.5 * (lo + hi)
+            mid_price = cls.price(spot, strike, rate, mid, ttm, option_type, steps=steps)
+            if abs(mid_price - market_price) < tol:
+                return mid
+            if mid_price > market_price:
+                hi = mid
+            else:
+                lo = mid
+        return 0.5 * (lo + hi)
+
+
+
+class DeltaHedgeStrategy:
+    """Strategy module: produce target hedge position from bars."""
+
+    def __init__(self, cfg_exp: ExperimentConfig):
+        self.cfg_hedge = cfg_exp.hedge
+        self.iv_cache_by_option: dict[str, float] = {}
+
+    def on_bar(
+        self,
+        selected: SelectedContracts,
+        trade_date: date,
+        bar: dict,
+        rate: float,
+    ) -> StrategyDecision | None:
+        fut_open = _safe_float(bar["future_open"])
+        fut_px = _safe_float(bar["future_close"])
+        call_px = _safe_float(bar["call_close"])
+        put_px = _safe_float(bar["put_close"])
+        if fut_open <= 0:
+            fut_open = fut_px
+        if fut_px <= 0 or fut_open <= 0:
+            return None
+
+        ttm = _year_fraction(selected.option_expiry_date, trade_date)
+        iv_call = self.iv_cache_by_option.get(selected.call_ts_code, 0.2)
+        iv_put = self.iv_cache_by_option.get(selected.put_ts_code, 0.2)
+        # 对冲目标用bar open的期货价格计算，匹配开仓对冲时点
+        delta_call = CrrModel.delta(fut_open, selected.strike, rate, iv_call, ttm, "C")
+        delta_put = CrrModel.delta(fut_open, selected.strike, rate, iv_put, ttm, "P")
+        combo_delta = delta_call + delta_put
+
+        scale = 1.0
+        if self.cfg_hedge.use_contract_unit:
+            scale = selected.option_per_unit / max(selected.future_per_unit, 1e-9)
+        target_pos = -combo_delta * scale
+
+        strategy_decision = StrategyDecision(
+            trade_date=trade_date,
+            bar_ts=bar["bar_ts"],
+            future_ts_code=selected.future_ts_code,
+            future_close=fut_px,
+            future_per_unit=selected.future_per_unit,
+            call_ts_code=selected.call_ts_code,
+            call_close=call_px,
+            put_ts_code=selected.put_ts_code,
+            put_close=put_px,
+            option_per_unit=selected.option_per_unit,
+            rate=rate,
+            ttm=ttm,
+            iv_call_used=iv_call,
+            iv_put_used=iv_put,
+            delta_call=delta_call,
+            delta_put=delta_put,
+            combo_delta=combo_delta,
+            target_future_position=target_pos,
         )
-        .sort("trade_date")
-    )
-    print(daily_position)
-    plot_daily_pnl(
-        delta_hedge_runner.daily_result, 
-        output_path=f"outputs/daily_pnl_{cfg_exp.backtest.start_date}_{cfg_exp.backtest.end_date}.png", 
-        show=False)
+        return strategy_decision
+
+    def on_day_close(self, selected: SelectedContracts, trade_date: date, last_bar: dict, rate: float) -> None:
+        spot = _safe_float(last_bar["future_close"])
+        if spot <= 0:
+            return
+        ttm = _year_fraction(selected.option_expiry_date, trade_date)
+        call_px = _safe_float(last_bar["call_close"])
+        put_px = _safe_float(last_bar["put_close"])
+        self.iv_cache_by_option[selected.call_ts_code] = CrrModel.implied_vol(call_px, spot, selected.strike, rate, ttm, "C")
+        self.iv_cache_by_option[selected.put_ts_code] = CrrModel.implied_vol(put_px, spot, selected.strike, rate, ttm, "P")
+
+
+
+
+class DeltaHedgeRunner:
+    "add data -> rebalance -> broker"
+
+    def __init__(self, cfg_exp: ExperimentConfig, strategy_name: str) -> None:
+        self.strategy_name = strategy_name
+        self.cfg_exp = cfg_exp
+        self.data_module = BacktestDataModule(cfg_exp)
+        self.data_module.adddata()
+        self.strategy = DeltaHedgeStrategy(cfg_exp=cfg_exp)
+        self.risk_rater = RiskFreeRate(interest_df=self.data_module.shibor_daily)
+        self.selector = ContractSelector(
+            cfg_exp=self.cfg_exp,
+            fut_basic=self.data_module.fut_basic,
+            opt_basic=self.data_module.opt_basic,
+            fut_bars=self.data_module.fut_bars,
+            opt_bars=self.data_module.opt_bars,
+        )
+        self.broker = BrokerEngine(straddle_size=cfg_exp.hedge.straddle_size, data_loader=self.data_module)
+        self.backtetst_result = pl.DataFrame()
+        self.daily_decision: list[StrategyDecision] = []
+
+
+    def run(self) -> pl.DataFrame:
+
+        log_info("开始回测")
+        for trade_date in self.data_module.trade_dates:
+            selected = self.selector.select_contract(trade_date)
+            if selected is None:
+                continue
+            day_bars = self.data_module.get_day_bars(selected, trade_date)
+            if day_bars.is_empty():
+                continue
+
+            rate = self.risk_rater.get_rate(
+                trade_date, _year_fraction(selected.option_expiry_date, trade_date)
+            )
+
+            for bar in day_bars.iter_rows(named=True):
+                decision = self.strategy.on_bar(selected, trade_date, bar, rate)
+                if decision is None:
+                    continue
+                self.broker.on_decision(decision)
+            self.strategy.on_day_close(selected, trade_date, day_bars.tail(1).row(0, named=True), rate)
+            self.daily_decision.append(decision)
+        self.broker.on_decision_with_close_pos(decision)
+        # 循环结束后，将broker.records转为pl.DataFrame
+        self.backtetst_result = pl.DataFrame([r.__dict__ for r in self.broker.records])
+        self.daily_decision = pl.DataFrame([d.__dict__ for d in self.daily_decision])
+        return self.backtetst_result
+
+
+class BrokerEngine:
+    def __init__(
+        self,
+        init_cash: float = 1_000_000.0,
+        fee_rate: float = 0.0005,
+        slippage_bps: float = 1.0,
+        straddle_size: float = 1.0,
+        margin_rate: float = 0.15,
+        data_loader: BacktestDataModule = None,
+    ):
+        self.init_cash = init_cash
+        self.fee_rate = fee_rate
+        self.slippage_bps = slippage_bps
+        self.straddle_size = straddle_size
+        self.margin_rate = margin_rate
+        self.cash = init_cash
+        self.data_loader = data_loader
+        self.positions = {}
+        self.pnl = 0.0
+        # futures
+        self.prev_future_code: str | None = None
+        self.current_future_code: str | None = None
+        self.prev_fut_px: float | None = None
+        self.future_per_unit: float = 15.0 
+        self.current_future_position = 0.0 
+        # options 
+        self.option_position_call = 0.0
+        self.option_position_put = 0.0
+        self.option_per_unit: float = 15.0
+        self.prev_call_close: float | None = None
+        self.prev_put_close: float | None = None
+        self.current_call_close: float | None = None
+        self.current_put_close: float | None = None
+        # trade_date
+        self.prev_trade_date: date | None = None
+        # records
+        self.records: list[BrokerRecord] = []
+        self.prev_nav: float | None = None
+
+        self.prev_decision: StrategyDecision | None = None
+        self.current_decision: StrategyDecision | None = None
+        self.prev_record: BrokerRecord | None = None
+    
+
+    def on_decision(self, decision: dict) -> None:
+        self.current_decision = decision
+        if self.prev_decision is None:
+            record = self.on_decision_with_open_pos(self.current_decision)
+        elif (
+            self.prev_decision.future_ts_code != self.current_decision.future_ts_code and
+            self.prev_decision.call_ts_code != self.current_decision.call_ts_code and
+            self.prev_decision.put_ts_code != self.current_decision.put_ts_code
+        ):
+            record = self.on_decision_with_close_pos(self.prev_decision)
+            record = self.on_decision_with_open_pos(self.current_decision)
+        else:
+            record = self.on_decision_with_mtm(self.current_decision)
+        self.prev_decision = decision
+        self.prev_record = record
+
+    def on_decision_with_open_pos(self, decision: dict) -> BrokerRecord:
+        self.current_future_code = decision.future_ts_code
+        self.future_per_unit = decision.future_per_unit
+        # open futures
+        fut_px = _safe_float(decision.future_close)
+        if fut_px <= 0:
+            return None
+        target_pos = _safe_float(decision.target_future_position) * self.straddle_size
+        trade_qty = target_pos - self.current_future_position
+        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
+        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
+        future_contract_value = abs(trade_qty) * exec_price * self.future_per_unit
+        slippage_cost = trade_qty * (exec_price - fut_px) * self.future_per_unit
+        self.cash -= future_contract_value
+
+        fut_fee = abs(trade_qty) * exec_price * self.future_per_unit * self.fee_rate
+        self.cash -= fut_fee
+        
+        self.current_future_position = target_pos
+
+        # open call 
+        call_px = _safe_float(decision.call_close)
+        call_contract_value = call_px * self.straddle_size * self.option_per_unit
+        call_fee = call_contract_value * self.fee_rate
+        self.cash -= call_contract_value
+        self.cash -= call_fee
+        self.option_position_call = self.straddle_size
+        self.current_call_close = call_px
+
+        # open put 
+        put_px = _safe_float(decision.put_close)
+        put_contract_value = put_px * self.straddle_size * self.option_per_unit
+        put_fee = put_contract_value * self.fee_rate
+        self.cash -= put_contract_value
+        self.cash -= put_fee
+        self.option_position_put = self.straddle_size
+        self.current_put_close = put_px
+
+        self.pnl = 0.0
+
+        record = BrokerRecord(
+            trade_date=decision.trade_date,
+            bar_ts=decision.bar_ts,
+            nav=future_contract_value + call_contract_value + put_contract_value + self.cash + self.pnl,
+            pnl=0.0,
+            pnl_future=0.0,
+            pnl_call=0.0,
+            pnl_put=0.0,
+            pnl_option=0.0,
+            cash=self.cash,
+            cash_future=- future_contract_value,
+            cash_call=- call_contract_value,
+            cash_put=- put_contract_value,
+            cash_option=- call_contract_value - put_contract_value,
+            future_ts_code=decision.future_ts_code,
+            future_pnl=0.0,
+            future_notional=future_contract_value,
+            call_ts_code=decision.call_ts_code,
+            call_pnl=0.0,
+            call_notional=call_contract_value,
+            put_ts_code=decision.put_ts_code,
+            put_pnl=0.0,
+            put_notional=put_contract_value,
+            option_pnl=0.0,
+            option_notional=call_contract_value + put_contract_value,
+            fee=fut_fee + call_fee + put_fee,
+            fee_future=fut_fee,
+            fee_call=call_fee,
+            fee_put=put_fee,
+            fee_option=call_fee + put_fee,
+            slippage=slippage_cost,
+            name="open",
+        )
+        self.records.append(record)
+        return record
+    
+    def on_decision_with_close_pos(self, decision: dict) -> BrokerRecord:
+        # close futures
+        fut_px = self.data_loader.get_bar(
+            ts_code=decision.future_ts_code,
+            bar_ts=self.current_decision.bar_ts,
+            instrument_type="future",
+        )["close"].item()
+        if fut_px <= 0:
+            return None
+        
+        trade_qty = - self.current_future_position
+        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
+        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
+        future_contract_value = abs(trade_qty) * exec_price * self.future_per_unit
+        slippage_cost = trade_qty * (exec_price - fut_px) * self.future_per_unit
+        self.cash += future_contract_value
+
+        fut_fee = abs(trade_qty) * exec_price * self.future_per_unit * self.fee_rate
+        self.cash -= fut_fee
+        self.current_future_position = 0.0
+        self.current_future_code = None
+        self.future_per_unit = None
+
+        # close call 
+        call_px = self.data_loader.get_bar(
+            ts_code=decision.call_ts_code,
+            bar_ts=self.current_decision.bar_ts,
+            instrument_type="call",
+        )["close"].item()
+        call_contract_value = call_px * self.option_position_call * self.option_per_unit
+        call_fee = call_contract_value * self.fee_rate
+        self.cash += call_contract_value 
+        self.cash -= call_fee
+        self.option_position_call = 0.0
+        self.current_call_close = None
+
+        # close put 
+        put_px = self.data_loader.get_bar(
+            ts_code=decision.put_ts_code,
+            bar_ts=self.current_decision.bar_ts,
+            instrument_type="put",
+        )["close"].item()
+        put_contract_value = put_px * self.option_position_put * self.option_per_unit
+        put_fee = put_contract_value * self.fee_rate
+        self.cash += put_contract_value 
+        self.cash -= put_fee
+        self.option_position_put = 0.0
+        self.current_put_close = None
+        
+        record = BrokerRecord(
+            trade_date=self.current_decision.trade_date,
+            bar_ts=self.current_decision.bar_ts,
+            nav=self.cash,
+            pnl=0.0,
+            pnl_future=0.0,
+            pnl_call=0.0,
+            pnl_put=0.0,
+            pnl_option=0.0,
+            cash=self.cash,
+            cash_future=future_contract_value,
+            cash_call=call_contract_value,
+            cash_put=put_contract_value,
+            cash_option=call_contract_value + put_contract_value,
+            future_ts_code=decision.future_ts_code,
+            future_pnl=0.0,
+            future_notional=0.0,
+            call_ts_code=decision.call_ts_code,
+            call_pnl=0.0,
+            call_notional=0.0,
+            put_ts_code=decision.put_ts_code,
+            put_pnl=0.0,
+            put_notional=0.0,
+            option_pnl=0.0,
+            option_notional=0.0,
+            fee=fut_fee + call_fee + put_fee,
+            fee_future=fut_fee,
+            fee_call=call_fee,
+            fee_put=put_fee,
+            fee_option=call_fee + put_fee,
+            slippage=slippage_cost,
+            name="close",
+        )
+        self.records.append(record)
+        return record
+
+    def on_decision_with_mtm(self, decision: dict) -> BrokerRecord:
+        # futures 
+        fut_px = _safe_float(decision.future_close)
+        if fut_px <= 0:
+            return None
+        prev_fut_px = self.prev_decision.future_close
+        if prev_fut_px <= 0:
+            return None
+        future_mtm_pnl = (fut_px - prev_fut_px) * self.current_future_position * self.future_per_unit
+        self.cash += future_mtm_pnl
+
+        # call option 
+        call_px = _safe_float(decision.call_close)
+        prev_call_px = self.prev_decision.call_close
+        if prev_call_px <= 0:
+            return None
+        call_mtm_pnl = (call_px - prev_call_px) * self.option_position_call * self.option_per_unit
+        self.cash += call_mtm_pnl
+
+        # put option 
+        put_px = _safe_float(decision.put_close)
+        prev_put_px = self.prev_decision.put_close
+        if prev_put_px <= 0:
+            return None     
+        put_mtm_pnl = (put_px - prev_put_px) * self.option_position_put * self.option_per_unit
+        self.cash += put_mtm_pnl
+
+        mtm_pnl = future_mtm_pnl + call_mtm_pnl + put_mtm_pnl
+
+        record = BrokerRecord(
+            trade_date=decision.trade_date,
+            bar_ts=decision.bar_ts,
+            nav=self.prev_record.nav + mtm_pnl,
+            pnl=future_mtm_pnl + call_mtm_pnl + put_mtm_pnl,
+            pnl_future=future_mtm_pnl,
+            pnl_call=call_mtm_pnl,
+            pnl_put=put_mtm_pnl,
+            pnl_option=call_mtm_pnl + put_mtm_pnl,
+            cash=self.cash,
+            cash_future=0.0,
+            cash_call=0.0,
+            cash_put=0.0,
+            cash_option=0.0,
+            future_ts_code=decision.future_ts_code,
+            future_pnl=future_mtm_pnl,
+            future_notional=fut_px * self.current_future_position * self.future_per_unit,
+            call_ts_code=decision.call_ts_code,
+            call_pnl=call_mtm_pnl,
+            call_notional=call_px * self.option_position_call * self.option_per_unit,
+            put_ts_code=decision.put_ts_code,
+            put_pnl=put_mtm_pnl,
+            put_notional=put_px * self.option_position_put * self.option_per_unit,
+            option_pnl=call_mtm_pnl + put_mtm_pnl,
+            option_notional=call_px * self.option_position_call * self.option_per_unit + put_px * self.option_position_put * self.option_per_unit,
+            fee=0.0,
+            fee_future=0.0,
+            fee_call=0.0,
+            fee_put=0.0,
+            fee_option=0.0,
+            slippage=0.0,
+            name='mtm'
+        )
+        self.records.append(record)
+        return record
+
+    
+    def to_frame(self) -> pl.DataFrame:
+        pass 
+    
+    def to_daily_frame(self) -> pl.DataFrame:
+        pass
+
+
+if __name__ == "__main__":
+    from core.config_shema import load_confg
+    cfg = load_confg("config/shfe_ag_demo.yaml")
+    runner = DeltaHedgeRunner(cfg_exp=cfg[0], strategy_name="delta_hedge_self")
+    runner.run()

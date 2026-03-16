@@ -45,4 +45,4 @@ def check_option_price_nulls(dir_path, threshold=0.05):
         print(bad_file)
 
 if __name__ == "__main__":
-    check_option_price_nulls("local_db/option_price_daily/SHFE_AG", threshold=0.6)
+    check_option_price_nulls("local_db/option_price_minute/SHFE_AG", threshold=0.7)
