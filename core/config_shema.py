@@ -33,6 +33,7 @@ class HedgeConfig:
     frequency: str
     contract_selection_mode: str
     straddle_size: int
+    fee_rate: float
     roll_days_before_maturity: int
     use_contract_unit: bool
 
@@ -86,6 +87,7 @@ def _build_config(raw: dict[str, Any]) -> list[ExperimentConfig]:
             frequency=freq,  # 单个回测配置只保留一个频率
             contract_selection_mode=hedge_raw["contract_selection_mode"],
             straddle_size=int(hedge_raw["straddle_size"]),
+            fee_rate=float(hedge_raw["fee_rate"]),
             roll_days_before_maturity=int(hedge_raw["roll_days_before_maturity"]),
             use_contract_unit=bool(hedge_raw["use_contract_unit"]),
         )

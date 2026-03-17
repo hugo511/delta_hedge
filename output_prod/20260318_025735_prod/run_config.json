@@ -1,0 +1,23 @@
+{
+  "backtest": {
+    "start_date": "2025-01-06",
+    "end_date": "2026-03-06"
+  },
+  "future": {
+    "name": "SHFE_AG",
+    "exchange": "SHFE",
+    "fut_code": "AG",
+    "update_basic": false
+  },
+  "hedge": {
+    "frequency": [
+      "1d",
+      "15min"
+    ],
+    "contract_selection_mode": "atm",
+    "straddle_size": 1,
+    "fee_rate": 0.0005,
+    "roll_days_before_maturity": 5,
+    "use_contract_unit": true
+  }
+}

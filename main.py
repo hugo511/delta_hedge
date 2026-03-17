@@ -11,7 +11,7 @@ import numpy as np
 import polars as pl
 import yaml
 
-from core.backtest_runner_self_prod import DeltaHedgeRunner
+from core.backtest_runner import DeltaHedgeRunner
 from core.config_shema import ExperimentConfig, load_config
 from utils.logger import log_info
 
@@ -33,7 +33,8 @@ def _serialize(obj: Any) -> Any:
 def _build_curve_data(backtest_result: pl.DataFrame) -> pl.DataFrame:
     if backtest_result.is_empty():
         return pl.DataFrame()
-    required_cols = {"bar_ts", "trade_date", "nav", "future_notional", "option_notional"}
+    # 统一使用新版回测输出口径：capital_used 代表资金占用（期货保证金）
+    required_cols = {"bar_ts", "trade_date", "nav", "capital_used"}
     if not required_cols.issubset(set(backtest_result.columns)):
         log_info(f"backtest_result 缺少必要列: {required_cols}")
         return pl.DataFrame()
@@ -42,9 +43,7 @@ def _build_curve_data(backtest_result: pl.DataFrame) -> pl.DataFrame:
         backtest_result
         .sort("bar_ts")
         .with_columns(
-            (
-                pl.col("future_notional").abs() + pl.col("option_notional").abs()
-            ).alias("capital_used"),
+            pl.col("margin_by_future").abs().alias("capital_used"),
         )
         .with_columns(
             (
@@ -55,14 +54,8 @@ def _build_curve_data(backtest_result: pl.DataFrame) -> pl.DataFrame:
             ).alias("return_rate"),
         )
         .select(
-            [
-                "bar_ts",
-                "trade_date",
-                "nav",
-                "capital_used",
-                "capital_usage",
-                "return_rate",
-            ]
+            ["bar_ts", "trade_date", "nav", "capital_used", "capital_usage", "return_rate"]
+            + (["name"] if "name" in backtest_result.columns else [])
         )
     )
 
@@ -72,32 +65,45 @@ def _plot_curves(curve_data: pl.DataFrame, output_path: Path, freq: str) -> None
         log_info("curve_data 为空，跳过绘图")
         return
 
-    pdf = curve_data.select(["bar_ts", "nav", "return_rate"]).to_pandas()
+    plot_data = curve_data
+    if "name" in curve_data.columns:
+        # close 记录对应平仓点，资金占用可能为0，默认不纳入曲线展示
+        filtered = curve_data.filter(pl.col("name") != "close")
+        if not filtered.is_empty():
+            plot_data = filtered
+
+    # 原始频率是 1d 还是 15minr”
+    daily_plot_data = (
+        plot_data
+        .sort(["trade_date", "bar_ts"])
+        .with_columns(pl.col("bar_ts").cast(pl.Datetime).alias("plot_ts"))
+    ).sort("plot_ts")
+
+    if daily_plot_data.is_empty():
+        log_info("daily_plot_data 为空，跳过绘图")
+        return
+
+    pdf = daily_plot_data.select(["plot_ts", "nav", "return_rate"]).to_pandas()
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
 
-    axes[0].plot(pdf["bar_ts"], pdf["nav"], lw=1.8, color="#1f77b4")
+    axes[0].plot(pdf["plot_ts"], pdf["nav"], lw=1.8, color="#1f77b4")
     axes[0].set_title(f"NAV (freq={freq})")
     axes[0].grid(alpha=0.25)
 
-    axes[1].plot(pdf["bar_ts"], pdf["return_rate"], lw=1.6, color="#2ca02c")
+    axes[1].plot(pdf["plot_ts"], pdf["return_rate"], lw=1.6, color="#2ca02c")
     axes[1].set_title(f"Return Rate (freq={freq})")
-    axes[1].set_xlabel("Bar Time")
+    axes[1].set_xlabel("Trade Date")
     axes[1].grid(alpha=0.25)
     axes[1].tick_params(axis="x", rotation=30)
 
-    # 分钟级频率显示到时分，其他频率显示到日期
-    is_minute_freq = "min" in freq.lower()
-    x_formatter = (
-        mdates.DateFormatter("%Y-%m-%d %H:%M")
-        if is_minute_freq
-        else mdates.DateFormatter("%Y-%m-%d")
-    )
+    x_formatter = mdates.DateFormatter("%Y-%m-%d")
     for ax in axes: 
         ax.xaxis.set_major_formatter(x_formatter)
 
     for ax in axes[:-1]:
         ax.tick_params(axis="x", labelbottom=False)
     fig.tight_layout()
+    # plt.show()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150)

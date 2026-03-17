@@ -59,35 +59,37 @@ class StrategyDecision:
     combo_delta: float
     target_future_position: float
 
-
 @dataclass
 class BrokerRecord:
     trade_date: date
     bar_ts: datetime
     nav: float
+    margin_by_future: float
+    cash: float
     pnl: float
     pnl_future: float
     pnl_call: float
     pnl_put: float
     pnl_option: float
-    cash: float
     cash_future: float
     cash_call: float
     cash_put: float
     cash_option: float
+    nav_future: float
+    nav_call: float
+    nav_put: float
+    nav_option: float
+    # capital_used
+    capital_used: float
+    capital_future: float
+    capital_call: float
+    capital_put: float
+    capital_option: float
     # future
     future_ts_code: str
-    future_pnl: float
-    future_notional: float
     # option
     call_ts_code: str
-    call_pnl: float
-    call_notional: float
     put_ts_code: str
-    put_pnl: float
-    put_notional: float
-    option_pnl: float
-    option_notional: float
     # fee
     fee: float
     fee_future: float
@@ -601,6 +603,364 @@ class DeltaHedgeStrategy:
         self.iv_cache_by_option[selected.put_ts_code] = CrrModel.implied_vol(put_px, spot, selected.strike, rate, ttm, "P")
 
 
+class BrokerEngine:
+    def __init__(
+        self,
+        init_cash: float = 1_000_000.0,
+        fee_rate: float = 0.0005,
+        slippage_bps: float = 1.0,
+        straddle_size: float = 1.0,
+        margin_rate: float = 0.15,
+        data_loader: BacktestDataModule = None,
+    ):
+
+        self.init_cash = init_cash
+        self.fee_rate = fee_rate
+        self.slippage_bps = slippage_bps
+        self.straddle_size = straddle_size
+        self.margin_rate = margin_rate
+        self.cash = init_cash
+        self.nav = init_cash
+        self.data_loader = data_loader
+        # futures
+        self.current_future_code: str | None = None
+        self.future_per_unit: float = 15.0 
+        self.current_future_position = 0.0 
+        self.margin_by_future: float = 0.0
+        # options 
+        self.option_position_call = 0.0
+        self.option_position_put = 0.0
+        self.option_per_unit: float = 15.0
+        self.current_call_close: float | None = None
+        self.current_put_close: float | None = None
+        # records
+        self.records: list[BrokerRecord] = []
+
+        self.prev_decision: StrategyDecision | None = None
+        self.current_decision: StrategyDecision | None = None
+        self.prev_record: BrokerRecord | None = None
+
+    def on_decision(self, decision: dict) -> None:
+        self.current_decision = decision
+        if self.prev_decision is None:
+            record = self.on_decision_with_open_pos(self.current_decision)
+        elif (
+            self.prev_decision.future_ts_code != self.current_decision.future_ts_code and
+            self.prev_decision.call_ts_code != self.current_decision.call_ts_code and
+            self.prev_decision.put_ts_code != self.current_decision.put_ts_code
+        ):
+            record = self.on_decision_with_close_pos(self.prev_decision)
+            record = self.on_decision_with_open_pos(self.current_decision)
+        else:
+            record = self.on_decision_with_mtm(self.current_decision)
+        self.prev_decision = decision
+        self.prev_record = record
+
+    def on_decision_with_open_pos(self, decision: StrategyDecision) -> BrokerRecord:
+        self.current_future_code = decision.future_ts_code
+        self.future_per_unit = decision.future_per_unit
+        # ======================== open futures ========================
+        fut_px = _safe_float(decision.future_close)
+        if fut_px <= 0:
+            return None
+        target_pos = _safe_float(decision.target_future_position) * self.straddle_size
+        trade_qty = target_pos - self.current_future_position
+        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
+        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
+        
+        # future margin 
+        future_margin = abs(trade_qty) * exec_price * self.future_per_unit * self.margin_rate 
+        self.cash -= future_margin
+        self.margin_by_future = future_margin
+
+        # future fee 
+        fut_fee = abs(trade_qty) * exec_price * self.future_per_unit * self.fee_rate
+        self.cash -= fut_fee
+
+        # future slippage_cost only for record
+        slippage_cost = abs(trade_qty) * abs(exec_price - fut_px) * self.future_per_unit
+
+        future_delta_nav = - fut_fee        
+        self.current_future_position = target_pos
+
+        # ======================== open call ========================
+        call_px = _safe_float(decision.call_close)
+        call_premium = call_px * self.straddle_size * self.option_per_unit
+        call_fee = call_premium * self.fee_rate 
+        # open long pos
+        self.cash += - call_premium - call_fee 
+        call_delta_nav = -call_fee
+
+        self.option_position_call = self.straddle_size
+        self.current_call_close = call_px
+
+        # ======================== open put ========================
+        put_px = _safe_float(decision.put_close)
+        put_premium = put_px * self.straddle_size * self.option_per_unit
+        put_fee = put_premium * self.fee_rate
+        # open long pos 
+        self.cash += - put_premium - put_fee
+        put_delta_nav = -put_fee
+
+        self.option_position_put = self.straddle_size
+        self.current_put_close = put_px
+
+        self.nav += future_delta_nav + call_delta_nav + put_delta_nav
+
+        record = BrokerRecord(
+            trade_date=decision.trade_date,
+            bar_ts=decision.bar_ts,
+            nav=self.nav,
+            margin_by_future=self.margin_by_future,
+            cash=self.cash,
+            pnl=0.0,
+            pnl_future=0.0,
+            pnl_call=0.0,
+            pnl_put=0.0,
+            pnl_option=0.0,
+            cash_future=-future_margin - fut_fee,
+            cash_call=-call_premium - call_fee,
+            cash_put=-put_premium - put_fee,
+            cash_option=-(call_premium + call_fee + put_premium + put_fee),
+            nav_future=future_delta_nav,
+            nav_call=call_delta_nav,
+            nav_put=put_delta_nav,
+            nav_option=call_delta_nav + put_delta_nav,
+            # capital_used
+            capital_used=future_margin + call_premium + put_premium,
+            capital_future=future_margin,
+            capital_call=call_premium,
+            capital_put=put_premium,
+            capital_option=call_premium + put_premium,
+            future_ts_code=decision.future_ts_code,
+            call_ts_code=decision.call_ts_code,
+            put_ts_code=decision.put_ts_code,
+            fee=fut_fee + call_fee + put_fee,
+            fee_future=fut_fee,
+            fee_call=call_fee,
+            fee_put=put_fee,
+            fee_option=call_fee + put_fee,
+            slippage=slippage_cost,
+            name="open",
+        )
+        self.records.append(record)
+        return record
+    
+    def on_decision_with_close_pos(self, decision: StrategyDecision) -> BrokerRecord:
+        # ======================== close futures ========================
+        fut_px = self.data_loader.get_bar(
+            ts_code=decision.future_ts_code,
+            bar_ts=self.current_decision.bar_ts,
+            instrument_type="future",
+        )["close"].item()
+        prev_fut_px = self.prev_decision.future_close
+        if fut_px <= 0:
+            return None
+        
+        trade_qty = - self.current_future_position
+        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
+        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
+        
+        # future_pnl
+        fut_pnl = (fut_px - prev_fut_px) * self.current_future_position * self.future_per_unit
+        self.cash += fut_pnl
+
+        # future margin 
+        margin_future = self.margin_by_future
+        self.cash += margin_future
+
+        # future fee 
+        fut_fee = abs(trade_qty) * exec_price * self.future_per_unit * self.fee_rate
+        self.cash -= fut_fee
+
+        # future slippage_cost only for record
+        slippage_cost = abs(trade_qty) * abs(exec_price - fut_px) * self.future_per_unit
+
+        future_delta_nav = fut_pnl - fut_fee        
+        self.current_future_position = 0.0
+        self.current_future_code = None
+        self.future_per_unit = None
+        self.margin_by_future = 0.0
+   
+        # ======================== close call ========================
+        call_px = self.data_loader.get_bar(
+            ts_code=decision.call_ts_code,
+            bar_ts=self.current_decision.bar_ts,
+            instrument_type="call",
+        )["close"].item()
+        prev_call_px = self.prev_decision.call_close
+
+        # call pnl
+        call_pnl = (call_px - prev_call_px) * self.option_position_call * self.option_per_unit
+
+        # close long pos
+        call_premium = call_px * self.straddle_size * self.option_per_unit
+        call_fee = call_premium * self.fee_rate
+        self.cash += call_premium - call_fee
+        call_delta_nav = call_pnl - call_fee
+
+        self.option_position_call = 0.0
+        self.current_call_close = None
+
+        # ======================== close put ========================
+        put_px = self.data_loader.get_bar(
+                    ts_code=decision.put_ts_code,
+                    bar_ts=self.current_decision.bar_ts,
+                    instrument_type="put",
+                )["close"].item()
+        prev_put_px = self.prev_decision.put_close
+
+        # put pnl
+        put_pnl = (put_px - prev_put_px) * self.option_position_put * self.option_per_unit
+
+        # close long pos
+        put_premium = put_px * self.straddle_size * self.option_per_unit
+        put_fee = put_premium * self.fee_rate
+        self.cash += put_premium - put_fee
+        put_delta_nav = put_pnl - put_fee
+
+        self.option_position_put = 0.0
+        self.current_put_close = None
+
+        self.nav += future_delta_nav + call_delta_nav + put_delta_nav
+        
+        record = BrokerRecord(
+            trade_date=self.current_decision.trade_date,
+            bar_ts=self.current_decision.bar_ts,
+            nav=self.nav,
+            margin_by_future=self.margin_by_future,
+            cash=self.cash,
+            pnl=fut_pnl + call_pnl + put_pnl,
+            pnl_future=fut_pnl,
+            pnl_call=call_pnl,
+            pnl_put=put_pnl,
+            pnl_option=call_pnl + put_pnl,
+            cash_future=fut_pnl - fut_fee + margin_future,
+            cash_call=call_premium - call_fee,
+            cash_put=put_premium - put_fee,
+            cash_option=call_premium - call_fee + put_premium - put_fee,
+            nav_future=future_delta_nav,
+            nav_call=call_delta_nav,
+            nav_put=put_delta_nav,
+            nav_option=call_delta_nav + put_delta_nav,
+            # capital_used
+            capital_used=None,
+            capital_future=None,
+            capital_call=None,
+            capital_put=None,
+            capital_option=None,
+            future_ts_code=decision.future_ts_code,
+            call_ts_code=decision.call_ts_code,
+            put_ts_code=decision.put_ts_code,
+            fee=fut_fee + call_fee + put_fee,
+            fee_future=fut_fee,
+            fee_call=call_fee,
+            fee_put=put_fee,
+            fee_option=call_fee + put_fee,
+            slippage=slippage_cost,
+            name="close",
+        )
+        self.records.append(record)
+        return record
+
+    def on_decision_with_mtm(self, decision: dict) -> BrokerRecord:
+        # ======================== mtm futures ========================
+        fut_px = _safe_float(decision.future_close)
+        prev_fut_px = self.prev_decision.future_close
+
+        # future pnl 
+        fut_pnl = (fut_px - prev_fut_px) * self.current_future_position * self.future_per_unit
+        self.cash += fut_pnl
+
+        # -------------- future delta hedge --------------
+        target_future_position = _safe_float(decision.target_future_position) * self.straddle_size
+        trade_qty = target_future_position - self.current_future_position
+        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
+        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
+
+        # future_fee 
+        fut_fee = abs(trade_qty) * exec_price * self.future_per_unit * self.fee_rate
+        self.cash -= fut_fee
+
+        # future slippage_cost only for record
+        slippage_cost = abs(trade_qty) * abs(exec_price - fut_px) * self.future_per_unit
+        self.current_future_position = target_future_position
+
+        # future margin 
+        future_margin = abs(self.current_future_position) * exec_price * self.future_per_unit * self.margin_rate
+        future_delta_margin = self.margin_by_future - future_margin
+        self.cash += future_delta_margin
+        self.margin_by_future = future_margin
+
+        future_delta_nav = fut_pnl - fut_fee
+        self.current_future_position = target_future_position
+
+        # ======================== mtm call ========================
+        call_px = _safe_float(decision.call_close)
+        prev_call_px = self.prev_decision.call_close
+
+        call_mtm_pnl = (call_px - prev_call_px) * self.option_position_call * self.option_per_unit
+        call_delta_nav = call_mtm_pnl
+
+        # ======================== mtm put ========================
+        put_px = _safe_float(decision.put_close)
+        prev_put_px = self.prev_decision.put_close
+
+        put_mtm_pnl = (put_px - prev_put_px) * self.option_position_put * self.option_per_unit
+        put_delta_nav = put_mtm_pnl
+        
+
+        self.nav += future_delta_nav + call_delta_nav + put_delta_nav
+
+        record = BrokerRecord(
+            trade_date=decision.trade_date,
+            bar_ts=decision.bar_ts,
+            nav=self.nav,
+            cash=self.cash,
+            margin_by_future=self.margin_by_future,
+            pnl=fut_pnl + call_mtm_pnl + put_mtm_pnl,
+            pnl_future=fut_pnl,
+            pnl_call=call_mtm_pnl,
+            pnl_put=put_mtm_pnl,
+            pnl_option=call_mtm_pnl + put_mtm_pnl,
+            cash_future=fut_pnl - fut_fee + future_delta_margin,
+            cash_call=0.0,
+            cash_put=0.0,
+            cash_option=0.0,
+            nav_future=future_delta_nav,
+            nav_call=call_delta_nav,
+            nav_put=put_delta_nav,
+            nav_option=call_delta_nav + put_delta_nav,
+            # capital_used
+            capital_used=None,
+            capital_future=future_margin,
+            capital_call=call_px * self.option_position_call * self.option_per_unit,
+            capital_put=put_px * self.option_position_put * self.option_per_unit,
+            capital_option=call_px * self.option_position_call * self.option_per_unit + put_px * self.option_position_put * self.option_per_unit,
+            future_ts_code=decision.future_ts_code,
+            call_ts_code=decision.call_ts_code,
+            put_ts_code=decision.put_ts_code,
+            fee=fut_fee,
+            fee_future=fut_fee,
+            fee_call=0.0,
+            fee_put=0.0,
+            fee_option=0.0,
+            slippage=slippage_cost,
+            name='mtm'
+        )
+        self.records.append(record)
+        return record
+
+    
+    def to_frame(self) -> pl.DataFrame:
+        pass 
+    
+    def to_daily_frame(self) -> pl.DataFrame:
+        pass
+
+
+
+
 
 
 class DeltaHedgeRunner:
@@ -654,298 +1014,15 @@ class DeltaHedgeRunner:
         return self.backtetst_result
 
 
-class BrokerEngine:
-    def __init__(
-        self,
-        init_cash: float = 1_000_000.0,
-        fee_rate: float = 0.0005,
-        slippage_bps: float = 1.0,
-        straddle_size: float = 1.0,
-        margin_rate: float = 0.15,
-        data_loader: BacktestDataModule = None,
-    ):
-        self.init_cash = init_cash
-        self.fee_rate = fee_rate
-        self.slippage_bps = slippage_bps
-        self.straddle_size = straddle_size
-        self.margin_rate = margin_rate
-        self.cash = init_cash
-        self.data_loader = data_loader
-        self.positions = {}
-        self.pnl = 0.0
-        # futures
-        self.prev_future_code: str | None = None
-        self.current_future_code: str | None = None
-        self.prev_fut_px: float | None = None
-        self.future_per_unit: float = 15.0 
-        self.current_future_position = 0.0 
-        # options 
-        self.option_position_call = 0.0
-        self.option_position_put = 0.0
-        self.option_per_unit: float = 15.0
-        self.prev_call_close: float | None = None
-        self.prev_put_close: float | None = None
-        self.current_call_close: float | None = None
-        self.current_put_close: float | None = None
-        # trade_date
-        self.prev_trade_date: date | None = None
-        # records
-        self.records: list[BrokerRecord] = []
-        self.prev_nav: float | None = None
 
-        self.prev_decision: StrategyDecision | None = None
-        self.current_decision: StrategyDecision | None = None
-        self.prev_record: BrokerRecord | None = None
-    
 
-    def on_decision(self, decision: dict) -> None:
-        self.current_decision = decision
-        if self.prev_decision is None:
-            record = self.on_decision_with_open_pos(self.current_decision)
-        elif (
-            self.prev_decision.future_ts_code != self.current_decision.future_ts_code and
-            self.prev_decision.call_ts_code != self.current_decision.call_ts_code and
-            self.prev_decision.put_ts_code != self.current_decision.put_ts_code
-        ):
-            record = self.on_decision_with_close_pos(self.prev_decision)
-            record = self.on_decision_with_open_pos(self.current_decision)
-        else:
-            record = self.on_decision_with_mtm(self.current_decision)
-        self.prev_decision = decision
-        self.prev_record = record
 
-    def on_decision_with_open_pos(self, decision: dict) -> BrokerRecord:
-        self.current_future_code = decision.future_ts_code
-        self.future_per_unit = decision.future_per_unit
-        # open futures
-        fut_px = _safe_float(decision.future_close)
-        if fut_px <= 0:
-            return None
-        target_pos = _safe_float(decision.target_future_position) * self.straddle_size
-        trade_qty = target_pos - self.current_future_position
-        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
-        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
-        future_contract_value = abs(trade_qty) * exec_price * self.future_per_unit
-        slippage_cost = trade_qty * (exec_price - fut_px) * self.future_per_unit
-        self.cash -= future_contract_value
 
-        fut_fee = abs(trade_qty) * exec_price * self.future_per_unit * self.fee_rate
-        self.cash -= fut_fee
-        
-        self.current_future_position = target_pos
 
-        # open call 
-        call_px = _safe_float(decision.call_close)
-        call_contract_value = call_px * self.straddle_size * self.option_per_unit
-        call_fee = call_contract_value * self.fee_rate
-        self.cash -= call_contract_value
-        self.cash -= call_fee
-        self.option_position_call = self.straddle_size
-        self.current_call_close = call_px
 
-        # open put 
-        put_px = _safe_float(decision.put_close)
-        put_contract_value = put_px * self.straddle_size * self.option_per_unit
-        put_fee = put_contract_value * self.fee_rate
-        self.cash -= put_contract_value
-        self.cash -= put_fee
-        self.option_position_put = self.straddle_size
-        self.current_put_close = put_px
 
-        self.pnl = 0.0
 
-        record = BrokerRecord(
-            trade_date=decision.trade_date,
-            bar_ts=decision.bar_ts,
-            nav=future_contract_value + call_contract_value + put_contract_value + self.cash + self.pnl,
-            pnl=0.0,
-            pnl_future=0.0,
-            pnl_call=0.0,
-            pnl_put=0.0,
-            pnl_option=0.0,
-            cash=self.cash,
-            cash_future=- future_contract_value,
-            cash_call=- call_contract_value,
-            cash_put=- put_contract_value,
-            cash_option=- call_contract_value - put_contract_value,
-            future_ts_code=decision.future_ts_code,
-            future_pnl=0.0,
-            future_notional=future_contract_value,
-            call_ts_code=decision.call_ts_code,
-            call_pnl=0.0,
-            call_notional=call_contract_value,
-            put_ts_code=decision.put_ts_code,
-            put_pnl=0.0,
-            put_notional=put_contract_value,
-            option_pnl=0.0,
-            option_notional=call_contract_value + put_contract_value,
-            fee=fut_fee + call_fee + put_fee,
-            fee_future=fut_fee,
-            fee_call=call_fee,
-            fee_put=put_fee,
-            fee_option=call_fee + put_fee,
-            slippage=slippage_cost,
-            name="open",
-        )
-        self.records.append(record)
-        return record
-    
-    def on_decision_with_close_pos(self, decision: dict) -> BrokerRecord:
-        # close futures
-        fut_px = self.data_loader.get_bar(
-            ts_code=decision.future_ts_code,
-            bar_ts=self.current_decision.bar_ts,
-            instrument_type="future",
-        )["close"].item()
-        if fut_px <= 0:
-            return None
-        
-        trade_qty = - self.current_future_position
-        trade_sign = 1.0 if trade_qty > 0 else -1.0 if trade_qty < 0 else 0.0
-        exec_price = fut_px * (1 + trade_sign * self.slippage_bps / 10000.0)
-        future_contract_value = abs(trade_qty) * exec_price * self.future_per_unit
-        slippage_cost = trade_qty * (exec_price - fut_px) * self.future_per_unit
-        self.cash += future_contract_value
 
-        fut_fee = abs(trade_qty) * exec_price * self.future_per_unit * self.fee_rate
-        self.cash -= fut_fee
-        self.current_future_position = 0.0
-        self.current_future_code = None
-        self.future_per_unit = None
-
-        # close call 
-        call_px = self.data_loader.get_bar(
-            ts_code=decision.call_ts_code,
-            bar_ts=self.current_decision.bar_ts,
-            instrument_type="call",
-        )["close"].item()
-        call_contract_value = call_px * self.option_position_call * self.option_per_unit
-        call_fee = call_contract_value * self.fee_rate
-        self.cash += call_contract_value 
-        self.cash -= call_fee
-        self.option_position_call = 0.0
-        self.current_call_close = None
-
-        # close put 
-        put_px = self.data_loader.get_bar(
-            ts_code=decision.put_ts_code,
-            bar_ts=self.current_decision.bar_ts,
-            instrument_type="put",
-        )["close"].item()
-        put_contract_value = put_px * self.option_position_put * self.option_per_unit
-        put_fee = put_contract_value * self.fee_rate
-        self.cash += put_contract_value 
-        self.cash -= put_fee
-        self.option_position_put = 0.0
-        self.current_put_close = None
-        
-        record = BrokerRecord(
-            trade_date=self.current_decision.trade_date,
-            bar_ts=self.current_decision.bar_ts,
-            nav=self.cash,
-            pnl=0.0,
-            pnl_future=0.0,
-            pnl_call=0.0,
-            pnl_put=0.0,
-            pnl_option=0.0,
-            cash=self.cash,
-            cash_future=future_contract_value,
-            cash_call=call_contract_value,
-            cash_put=put_contract_value,
-            cash_option=call_contract_value + put_contract_value,
-            future_ts_code=decision.future_ts_code,
-            future_pnl=0.0,
-            future_notional=0.0,
-            call_ts_code=decision.call_ts_code,
-            call_pnl=0.0,
-            call_notional=0.0,
-            put_ts_code=decision.put_ts_code,
-            put_pnl=0.0,
-            put_notional=0.0,
-            option_pnl=0.0,
-            option_notional=0.0,
-            fee=fut_fee + call_fee + put_fee,
-            fee_future=fut_fee,
-            fee_call=call_fee,
-            fee_put=put_fee,
-            fee_option=call_fee + put_fee,
-            slippage=slippage_cost,
-            name="close",
-        )
-        self.records.append(record)
-        return record
-
-    def on_decision_with_mtm(self, decision: dict) -> BrokerRecord:
-        # futures 
-        fut_px = _safe_float(decision.future_close)
-        if fut_px <= 0:
-            return None
-        prev_fut_px = self.prev_decision.future_close
-        if prev_fut_px <= 0:
-            return None
-        future_mtm_pnl = (fut_px - prev_fut_px) * self.current_future_position * self.future_per_unit
-        self.cash += future_mtm_pnl
-
-        # call option 
-        call_px = _safe_float(decision.call_close)
-        prev_call_px = self.prev_decision.call_close
-        if prev_call_px <= 0:
-            return None
-        call_mtm_pnl = (call_px - prev_call_px) * self.option_position_call * self.option_per_unit
-        self.cash += call_mtm_pnl
-
-        # put option 
-        put_px = _safe_float(decision.put_close)
-        prev_put_px = self.prev_decision.put_close
-        if prev_put_px <= 0:
-            return None     
-        put_mtm_pnl = (put_px - prev_put_px) * self.option_position_put * self.option_per_unit
-        self.cash += put_mtm_pnl
-
-        mtm_pnl = future_mtm_pnl + call_mtm_pnl + put_mtm_pnl
-
-        record = BrokerRecord(
-            trade_date=decision.trade_date,
-            bar_ts=decision.bar_ts,
-            nav=self.prev_record.nav + mtm_pnl,
-            pnl=future_mtm_pnl + call_mtm_pnl + put_mtm_pnl,
-            pnl_future=future_mtm_pnl,
-            pnl_call=call_mtm_pnl,
-            pnl_put=put_mtm_pnl,
-            pnl_option=call_mtm_pnl + put_mtm_pnl,
-            cash=self.cash,
-            cash_future=0.0,
-            cash_call=0.0,
-            cash_put=0.0,
-            cash_option=0.0,
-            future_ts_code=decision.future_ts_code,
-            future_pnl=future_mtm_pnl,
-            future_notional=fut_px * self.current_future_position * self.future_per_unit,
-            call_ts_code=decision.call_ts_code,
-            call_pnl=call_mtm_pnl,
-            call_notional=call_px * self.option_position_call * self.option_per_unit,
-            put_ts_code=decision.put_ts_code,
-            put_pnl=put_mtm_pnl,
-            put_notional=put_px * self.option_position_put * self.option_per_unit,
-            option_pnl=call_mtm_pnl + put_mtm_pnl,
-            option_notional=call_px * self.option_position_call * self.option_per_unit + put_px * self.option_position_put * self.option_per_unit,
-            fee=0.0,
-            fee_future=0.0,
-            fee_call=0.0,
-            fee_put=0.0,
-            fee_option=0.0,
-            slippage=0.0,
-            name='mtm'
-        )
-        self.records.append(record)
-        return record
-
-    
-    def to_frame(self) -> pl.DataFrame:
-        pass 
-    
-    def to_daily_frame(self) -> pl.DataFrame:
-        pass
 
 
 if __name__ == "__main__":

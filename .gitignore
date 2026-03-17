@@ -12,6 +12,7 @@ wheels/
 
 # runtime artifacts
 core/core_ignore
+main_ignore
 outputs/
 logs/
 

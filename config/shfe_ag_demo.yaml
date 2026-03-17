@@ -11,8 +11,9 @@ future:
   update_basic: false
 
 hedge:
-  frequency: ["1d"]
+  frequency: ["1d", "15min"]
   contract_selection_mode: "atm"
   straddle_size: 1
+  fee_rate: 0.0005
   roll_days_before_maturity: 5
   use_contract_unit: true
