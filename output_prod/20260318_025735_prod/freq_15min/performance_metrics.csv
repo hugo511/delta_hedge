@@ -1,2 +1,0 @@
-frequency,start_date,end_date,trading_days,initial_nav,final_nav,total_return,annual_return,max_drawdown,max_drawdown_start_date,max_drawdown_date,max_drawdown_recovery_date,max_drawdown_duration_days,sharpe,calmar
-15min,2025-01-06,2026-03-06,332,1000879.743001275,1135437.942799665,0.1344399272133321,0.10079579996953414,-0.023819420174949535,2026-01-16,2026-01-19,2026-01-24,7,1.0855430796518397,4.231664718503069

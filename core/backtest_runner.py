@@ -3,9 +3,9 @@
 
 from typing import Literal
 import polars as pl
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
-from datetime import datetime
+from datetime import datetime, time
 import numpy as np
 import math
 
@@ -58,6 +58,12 @@ class StrategyDecision:
     delta_put: float
     combo_delta: float
     target_future_position: float
+    gamma_call: float
+    gamma_put: float
+    vega_call: float
+    vega_put: float
+    theta_call: float
+    theta_put: float
 
 @dataclass
 class BrokerRecord:
@@ -98,6 +104,22 @@ class BrokerRecord:
     fee_option: float
     slippage: float
     name: str=Literal["open", "mtm", "close"]
+
+
+@dataclass
+class BacktestRecord:
+    decision: StrategyDecision
+    broker_record: BrokerRecord
+
+    def flatten(self) -> dict:
+        d = {}
+        decision_dict = asdict(self.decision)
+        broker_dict = asdict(self.broker_record)
+
+        d.update(decision_dict)
+        d.update(broker_dict)
+        
+        return d
 
 
 
@@ -531,7 +553,86 @@ class CrrModel:
             else:
                 lo = mid
         return 0.5 * (lo + hi)
+    @classmethod
+    def gamma(
+        cls,
+        spot: float,
+        strike: float,
+        rate: float,
+        vol: float,
+        ttm: float,
+        option_type: str,
+        bump: float = 0.001,
+        steps: int = 80,
+    ) -> float:
+        # Gamma = d^2V/dS^2, centered difference approx
+        if spot <= 0:
+            return 0.0
+        up_spot = spot * (1 + bump)
+        dn_spot = max(spot * (1 - bump), 1e-6)
+        v_up = cls.price(up_spot, strike, rate, vol, ttm, option_type, steps=steps)
+        v_mid = cls.price(spot, strike, rate, vol, ttm, option_type, steps=steps)
+        v_dn = cls.price(dn_spot, strike, rate, vol, ttm, option_type, steps=steps)
+        return (v_up - 2 * v_mid + v_dn) / ((up_spot - spot) * (spot - dn_spot))
 
+    @classmethod
+    def vega(
+        cls,
+        spot: float,
+        strike: float,
+        rate: float,
+        vol: float,
+        ttm: float,
+        option_type: str,
+        bump: float = 0.001,  # 相对变动
+        steps: int = 80,
+        unit: str = "percent"  # "percent" 或 "unit"
+    ) -> float:
+        """
+        Calculate vega (dV/dσ).
+        
+        Parameters
+        ----------
+        unit : str
+            "percent" - return vega per 1% change in volatility (industry standard)
+            "unit" - return vega per 100% change in volatility (raw derivative)
+        """
+        if vol <= 0 or spot <= 0:
+            return 0.0
+        
+        up_vol = vol * (1 + bump)
+        dn_vol = max(vol * (1 - bump), 1e-6)
+        v_up = cls.price(spot, strike, rate, up_vol, ttm, option_type, steps=steps)
+        v_dn = cls.price(spot, strike, rate, dn_vol, ttm, option_type, steps=steps)
+        
+        # 原始vega：每100%波动率变化的价格变化
+        vega_raw = (v_up - v_dn) / (up_vol - dn_vol)
+        
+        # 根据单位转换
+        if unit.lower() == "percent":
+            return vega_raw * 0.01  # 转换为每1%波动率变化
+        else:  # "unit"
+            return vega_raw
+
+    @classmethod
+    def theta(
+        cls,
+        spot: float,
+        strike: float,
+        rate: float,
+        vol: float,
+        ttm: float,
+        option_type: str,
+        days_bump: float = 1 / 252,
+        steps: int = 80,
+    ) -> float:
+        # Theta = -dV/dt, dt in years. Default days_bump=1/252 for "per day"
+        if ttm <= 0 or spot <= 0:
+            return 0.0
+        ttm_minus = max(ttm - days_bump, 1e-6)
+        v_now = cls.price(spot, strike, rate, vol, ttm, option_type, steps=steps)
+        v_next = cls.price(spot, strike, rate, vol, ttm_minus, option_type, steps=steps)
+        return v_next - v_now
 
 
 class DeltaHedgeStrategy:
@@ -557,12 +658,19 @@ class DeltaHedgeStrategy:
         if fut_px <= 0 or fut_open <= 0:
             return None
 
-        ttm = _year_fraction(selected.option_expiry_date, trade_date)
+        option_expiry_datetime = datetime.combine(selected.option_expiry_date, time(15, 0, 0))
+        ttm = _year_fraction(option_expiry_datetime, bar["bar_ts"])       
         iv_call = self.iv_cache_by_option.get(selected.call_ts_code, 0.2)
         iv_put = self.iv_cache_by_option.get(selected.put_ts_code, 0.2)
         # 对冲目标用bar open的期货价格计算，匹配开仓对冲时点
         delta_call = CrrModel.delta(fut_open, selected.strike, rate, iv_call, ttm, "C")
+        gamma_call = CrrModel.gamma(fut_open, selected.strike, rate, iv_call, ttm, "C")
+        vega_call = CrrModel.vega(fut_open, selected.strike, rate, iv_call, ttm, "C")
+        theta_call = CrrModel.theta(fut_open, selected.strike, rate, iv_call, ttm, "C")
         delta_put = CrrModel.delta(fut_open, selected.strike, rate, iv_put, ttm, "P")
+        gamma_put = CrrModel.gamma(fut_open, selected.strike, rate, iv_put, ttm, "P")
+        vega_put = CrrModel.vega(fut_open, selected.strike, rate, iv_put, ttm, "P")
+        theta_put = CrrModel.theta(fut_open, selected.strike, rate, iv_put, ttm, "P")
         combo_delta = delta_call + delta_put
 
         scale = 1.0
@@ -589,6 +697,12 @@ class DeltaHedgeStrategy:
             delta_put=delta_put,
             combo_delta=combo_delta,
             target_future_position=target_pos,
+            gamma_call=gamma_call,
+            gamma_put=gamma_put,
+            vega_call=vega_call,
+            vega_put=vega_put,
+            theta_call=theta_call,
+            theta_put=theta_put,
         )
         return strategy_decision
 
@@ -981,9 +1095,9 @@ class DeltaHedgeRunner:
             opt_bars=self.data_module.opt_bars,
         )
         self.broker = BrokerEngine(straddle_size=cfg_exp.hedge.straddle_size, data_loader=self.data_module)
-        self.backtetst_result = pl.DataFrame()
         self.daily_decision: list[StrategyDecision] = []
-
+        self.backtest_record: list[BacktestRecord] = []
+        self.backtest_result = pl.DataFrame()
 
     def run(self) -> pl.DataFrame:
 
@@ -1004,15 +1118,23 @@ class DeltaHedgeRunner:
                 decision = self.strategy.on_bar(selected, trade_date, bar, rate)
                 if decision is None:
                     continue
+                # update broker record
                 self.broker.on_decision(decision)
+                # update backtest record
+                backtest_record = BacktestRecord(
+                    decision=decision, 
+                    broker_record=self.broker.prev_record
+                )
+                self.backtest_record.append(backtest_record)
+            
             self.strategy.on_day_close(selected, trade_date, day_bars.tail(1).row(0, named=True), rate)
             self.daily_decision.append(decision)
         self.broker.on_decision_with_close_pos(decision)
         # 循环结束后，将broker.records转为pl.DataFrame
-        self.backtetst_result = pl.DataFrame([r.__dict__ for r in self.broker.records])
+        self.broker_record = pl.DataFrame([r.__dict__ for r in self.broker.records])
         self.daily_decision = pl.DataFrame([d.__dict__ for d in self.daily_decision])
-        return self.backtetst_result
-
+        self.backtest_result = pl.DataFrame([b.flatten() for b in self.backtest_record])
+        return self.backtest_result
 
 
 

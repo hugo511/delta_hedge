@@ -5,16 +5,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
-import numpy as np
 import polars as pl
 import yaml
 
 from core.backtest_runner import DeltaHedgeRunner
 from core.config_shema import ExperimentConfig, load_config
 from utils.logger import log_info
-from utils.plot_utils import _build_curve_data, _compute_metrics, _plot_curves
+from utils.plot_utils import _build_curve_data, _compute_metrics, _plot_curves, _build_multi_freq_wide_data, _plot_multi_freq_curves_wide
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -39,18 +36,20 @@ def run_one_config(cfg: ExperimentConfig, run_dir: Path) -> None:
 
     runner = DeltaHedgeRunner(cfg_exp=cfg, strategy_name=f"delta_hedge_{freq}")
     backtest_result = runner.run()
+    broker_record = runner.broker_record
     daily_decision = runner.daily_decision
-    
     curve_data = _build_curve_data(backtest_result)
     metrics = _compute_metrics(curve_data, freq=freq)
 
     backtest_csv = freq_dir / "backtest_detail.csv"
+    broker_record_csv = freq_dir / "broker_record.csv"
     daily_decision_csv = freq_dir / "daily_decision.csv"
     curve_csv = freq_dir / "curve_data.csv"
     metrics_csv = freq_dir / "performance_metrics.csv"
     curves_png = freq_dir / "performance_curves.png"
 
     backtest_result.write_csv(backtest_csv)
+    broker_record.write_csv(broker_record_csv)
     daily_decision.write_csv(daily_decision_csv)
     curve_data.write_csv(curve_csv)
     metrics.write_csv(metrics_csv)
@@ -80,6 +79,19 @@ def main(config_path: str = "config/shfe_ag_demo.yaml") -> None:
     for cfg_one in cfg_list:
         run_one_config(cfg_one, run_dir=run_dir)
 
+    # plot
+    multi_freq_wide_df = _build_multi_freq_wide_data(run_dir=run_dir)
+    if not multi_freq_wide_df.is_empty():
+        _plot_multi_freq_curves_wide(
+            multi_freq_wide_df=multi_freq_wide_df,
+            output_path=run_dir / "performance_curves_multi_freq.png",
+            plot_every_n_trading_days=2,
+            sampling_mode="avg",
+        )
+        # multi_freq_wide_df.write_csv(run_dir / "multi_freq_curve.csv")
+        # log_info(f"已保存多频率宽表: {run_dir / 'multi_freq_curve.csv'}")
+    else:
+        log_info("多频率宽表为空，跳过合并绘图")
     log_info(f"全部回测结束，输出目录: {run_dir}")
 
 
