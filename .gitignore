@@ -13,7 +13,7 @@ wheels/
 # runtime artifacts
 core/core_ignore
 main_ignore
-outputs/
+outputs_debug/
 logs/
 
 # local_db: keep folder structure only

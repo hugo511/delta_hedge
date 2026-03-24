@@ -85,7 +85,7 @@ def main(config_path: str = "config/shfe_ag_demo.yaml") -> None:
         _plot_multi_freq_curves_wide(
             multi_freq_wide_df=multi_freq_wide_df,
             output_path=run_dir / "performance_curves_multi_freq.png",
-            plot_every_n_trading_days=2,
+            plot_every_n_trading_days=3,
             sampling_mode="avg",
         )
         # multi_freq_wide_df.write_csv(run_dir / "multi_freq_curve.csv")

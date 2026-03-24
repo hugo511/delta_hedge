@@ -88,6 +88,6 @@ local_db/
 - `local_db` 下的数据文件（如 `*.parquet`）不提交到 Git
 - 仓库仅保留目录结构占位文件（`.gitkeep`）
 - 下载local_db数据：通过网盘分享的文件：local_db.zip
-链接: https://pan.baidu.com/s/1NVl33u8SfHLR3dMI9DaC3A?pwd=2bn4 提取码: 2bn4
+链接: https://pan.baidu.com/s/1knb8_J5rnX9Wxhy-Feuk1w?pwd=2z5s 提取码: 2z5s
 
 
