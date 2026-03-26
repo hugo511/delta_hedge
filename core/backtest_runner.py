@@ -105,6 +105,7 @@ class BrokerRecord:
     fee_put: float
     fee_option: float
     slippage: float
+    theta_loss: float
     name: str=Literal["open", "mtm", "close"]
 
 
@@ -912,6 +913,7 @@ class BrokerEngine:
             fee_put=put_fee,
             fee_option=call_fee + put_fee,
             slippage=slippage_cost,
+            theta_loss=0.0,
             name="open",
         )
         self.records.append(record)
@@ -987,6 +989,14 @@ class BrokerEngine:
         self.current_put_close = None
 
         self.nav += future_delta_nav + call_delta_nav + put_delta_nav
+
+        # 计算从上一决策到当前bar的theta损失
+        if self.prev_decision is not None:
+            dt_days = (decision.bar_ts - self.prev_decision.bar_ts).total_seconds() / (24 * 3600)
+            theta_total = (self.prev_decision.theta_call + self.prev_decision.theta_put)
+            theta_loss = theta_total * dt_days * self.straddle_size * self.option_per_unit
+        else:
+            theta_loss = 0.0
         
         record = BrokerRecord(
             trade_date=self.current_decision.trade_date,
@@ -1022,6 +1032,7 @@ class BrokerEngine:
             fee_put=put_fee,
             fee_option=call_fee + put_fee,
             slippage=slippage_cost,
+            theta_loss=theta_loss,
             name="close",
         )
         self.records.append(record)
@@ -1076,6 +1087,17 @@ class BrokerEngine:
 
         self.nav += future_delta_nav + call_delta_nav + put_delta_nav
 
+        # --- 新增：计算该bar的theta损失 ---
+        # 获取时间间隔（天数）
+        if self.prev_decision is not None:
+            dt_days = (decision.bar_ts - self.prev_decision.bar_ts).total_seconds() / (24 * 3600)
+            # theta_call 和 theta_put 已经是日度变化（即一天的价格变化）
+            theta_total = (self.prev_decision.theta_call + self.prev_decision.theta_put)
+            # 乘以持仓数量、合约乘数，得到现金损失
+            theta_loss = theta_total * dt_days * self.straddle_size * self.option_per_unit
+        else:
+            theta_loss = 0.0
+
         record = BrokerRecord(
             trade_date=decision.trade_date,
             bar_ts=decision.bar_ts,
@@ -1110,6 +1132,7 @@ class BrokerEngine:
             fee_put=0.0,
             fee_option=0.0,
             slippage=slippage_cost,
+            theta_loss=theta_loss,
             name='mtm'
         )
         self.records.append(record)
