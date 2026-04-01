@@ -1325,6 +1325,9 @@ class DeltaHedgeRunner:
             pl.col("pnl_call").cum_sum().alias("pnl_call_cumsum"),
             pl.col("pnl_put").cum_sum().alias("pnl_put_cumsum"),
             pl.col("pnl_option").cum_sum().alias("pnl_option_cumsum"),
+            pl.col("future_close").pct_change().alias("future_return_rate"),
+            pl.col("call_settle").pct_change().alias("call_return_rate"),
+            pl.col("put_settle").pct_change().alias("put_return_rate"),
         )
         return self.backtest_result
 
